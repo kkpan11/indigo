@@ -26,12 +26,9 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/carlmjohnson/versioninfo"
-	logging "github.com/ipfs/go-log"
 	"github.com/ipld/go-car"
 	cli "github.com/urfave/cli/v2"
 )
-
-var log = logging.Logger("stress")
 
 func main() {
 	run(os.Args)
@@ -135,7 +132,7 @@ var postingCmd = &cli.Command{
 					res, err := comatproto.RepoCreateRecord(context.TODO(), xrpcc, &comatproto.RepoCreateRecord_Input{
 						Collection: "app.bsky.feed.post",
 						Repo:       xrpcc.Auth.Did,
-						Record: &lexutil.LexiconTypeDecoder{&appbsky.FeedPost{
+						Record: &lexutil.LexiconTypeDecoder{Val: &appbsky.FeedPost{
 							Text:      hex.EncodeToString(buf),
 							CreatedAt: time.Now().Format(time.RFC3339),
 						}},

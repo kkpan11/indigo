@@ -3,7 +3,7 @@
 #   podman build -f ./cmd/bigsky/Dockerfile -t bigsky .
 
 ### Compile stage
-FROM golang:1.21-alpine3.18 AS build-env
+FROM golang:1.23-alpine3.20 AS build-env
 RUN apk add --no-cache build-base make git
 
 ADD . /dockerbuild
@@ -26,9 +26,9 @@ RUN yarn install --frozen-lockfile
 RUN yarn build
 
 ### Run stage
-FROM alpine:3.18
+FROM alpine:3.20
 
-RUN apk add --no-cache --update dumb-init ca-certificates
+RUN apk add --no-cache --update dumb-init ca-certificates runit
 ENTRYPOINT ["dumb-init", "--"]
 
 WORKDIR /
@@ -45,5 +45,5 @@ EXPOSE 2470
 CMD ["/bigsky"]
 
 LABEL org.opencontainers.image.source=https://github.com/bluesky-social/indigo
-LABEL org.opencontainers.image.description="ATP Big Graph Server (BGS)"
+LABEL org.opencontainers.image.description="ATP Relay (aka BGS)"
 LABEL org.opencontainers.image.licenses=MIT

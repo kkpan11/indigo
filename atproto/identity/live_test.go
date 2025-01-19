@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,13 +22,13 @@ func testDirectoryLive(t *testing.T, d Directory) {
 
 	handle := syntax.Handle("atproto.com")
 	did := syntax.DID("did:plc:ewvi7nxzyoun6zhxrhs64oiz")
-	pds := "https://bsky.social"
+	pdsSuffix := "host.bsky.network"
 
 	resp, err := d.LookupHandle(ctx, handle)
 	assert.NoError(err)
 	assert.Equal(handle, resp.Handle)
 	assert.Equal(did, resp.DID)
-	assert.Equal(pds, resp.PDSEndpoint())
+	assert.True(strings.HasSuffix(resp.PDSEndpoint(), pdsSuffix))
 	dh, err := resp.DeclaredHandle()
 	assert.NoError(err)
 	assert.Equal(handle, dh)
@@ -39,16 +40,16 @@ func testDirectoryLive(t *testing.T, d Directory) {
 	assert.NoError(err)
 	assert.Equal(handle, resp.Handle)
 	assert.Equal(did, resp.DID)
-	assert.Equal(pds, resp.PDSEndpoint())
+	assert.True(strings.HasSuffix(resp.PDSEndpoint(), pdsSuffix))
 
 	_, err = d.LookupHandle(ctx, syntax.Handle("fake-dummy-no-resolve.atproto.com"))
-	assert.Equal(ErrHandleNotFound, err)
+	assert.ErrorIs(err, ErrHandleNotFound)
 
 	_, err = d.LookupDID(ctx, syntax.DID("did:web:fake-dummy-no-resolve.atproto.com"))
-	assert.Equal(ErrDIDNotFound, err)
+	assert.ErrorIs(err, ErrDIDNotFound)
 
 	_, err = d.LookupDID(ctx, syntax.DID("did:plc:fake-dummy-no-resolve.atproto.com"))
-	assert.Equal(ErrDIDNotFound, err)
+	assert.ErrorIs(err, ErrDIDNotFound)
 
 	_, err = d.LookupHandle(ctx, syntax.HandleInvalid)
 	assert.Error(err)
@@ -63,7 +64,7 @@ func TestBaseDirectory(t *testing.T) {
 func TestCacheDirectory(t *testing.T) {
 	t.Skip("TODO: skipping live network test")
 	inner := BaseDirectory{}
-	d := NewCacheDirectory(&inner, 1000, time.Hour*1, time.Hour*1)
+	d := NewCacheDirectory(&inner, 1000, time.Hour*1, time.Hour*1, time.Hour*1)
 	for i := 0; i < 3; i = i + 1 {
 		testDirectoryLive(t, &d)
 	}
@@ -86,7 +87,7 @@ func TestCacheCoalesce(t *testing.T) {
 		TryAuthoritativeDNS:   true,
 		SkipDNSDomainSuffixes: []string{".bsky.social"},
 	}
-	dir := NewCacheDirectory(&base, 1000, time.Hour*1, time.Hour*1)
+	dir := NewCacheDirectory(&base, 1000, time.Hour*1, time.Hour*1, time.Hour*1)
 	// All 60 routines launch at the same time, so they should all miss the cache initially
 	routines := 60
 	wg := sync.WaitGroup{}
@@ -129,11 +130,25 @@ func TestFallbackDNS(t *testing.T) {
 	// valid DNS server
 	_, err := dir.LookupHandle(ctx, handle)
 	assert.Error(err)
-	assert.Equal(ErrHandleNotFound, err)
+	assert.ErrorIs(err, ErrHandleNotFound)
 
 	// invalid DNS server syntax
 	dir.FallbackDNSServers = []string{"_"}
 	_, err = dir.LookupHandle(ctx, handle)
 	assert.Error(err)
-	assert.NotEqual(ErrHandleNotFound, err)
+	assert.ErrorIs(err, ErrHandleResolutionFailed)
+}
+
+func TestResolveNSID(t *testing.T) {
+	t.Skip("TODO: skipping live network test")
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	dir := BaseDirectory{}
+	// NOTE: this was a very short temporary NSID when rkey restriction was short
+	nsid := syntax.NSID("net.bnewbold.m")
+	did, err := dir.ResolveNSID(ctx, nsid)
+
+	assert.NoError(err)
+	assert.Equal(did, syntax.DID("did:plc:nhxcyu4ewwhl5pqil4dotqjo"))
 }

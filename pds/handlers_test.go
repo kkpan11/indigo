@@ -17,7 +17,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func testCarStore(t *testing.T, db *gorm.DB) (*carstore.CarStore, func()) {
+func testCarStore(t *testing.T, db *gorm.DB) (carstore.CarStore, func()) {
 	t.Helper()
 	tempdir, err := os.MkdirTemp("", "msttest-")
 	if err != nil {
@@ -29,7 +29,7 @@ func testCarStore(t *testing.T, db *gorm.DB) (*carstore.CarStore, func()) {
 		t.Fatal(err)
 	}
 
-	cs, err := carstore.NewCarStore(db, sharddir)
+	cs, err := carstore.NewCarStore(db, []string{sharddir})
 	if err != nil {
 		t.Fatal(err)
 	}

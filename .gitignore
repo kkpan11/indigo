@@ -17,7 +17,7 @@ _build/
 src/build/
 *.log
 *.db
-data/
+/data/
 test-coverage.out
 
 # executables
@@ -26,13 +26,13 @@ test-coverage.out
 /bigsky
 /fakermaker
 /gosky
-/labelmaker
 /laputa
 /lexgen
 /palomar
 /sonar-cli
 /stress
 /supercollider
+/hepa
 
 # Don't ignore this file itself, or other specific dotfiles
 !.gitignore
@@ -46,3 +46,6 @@ sonar_cursor.json
 out/
 state.json
 netsync-out/
+
+# Relay dash output
+/public/
