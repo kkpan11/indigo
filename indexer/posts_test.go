@@ -50,7 +50,7 @@ func testIndexer(t *testing.T) *testIx {
 		t.Fatal(err)
 	}
 
-	cs, err := carstore.NewCarStore(cardb, cspath)
+	cs, err := carstore.NewCarStore(cardb, []string{cspath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func testIndexer(t *testing.T) *testIx {
 
 	didr := testPLC(t)
 
-	rf := NewRepoFetcher(maindb, repoman)
+	rf := NewRepoFetcher(maindb, repoman, 10)
 
 	ix, err := NewIndexer(maindb, notifman, evtman, didr, rf, false, true, true)
 	if err != nil {
@@ -81,6 +81,7 @@ func (ix *testIx) Cleanup() {
 	if ix.dir != "" {
 		_ = os.RemoveAll(ix.dir)
 	}
+	ix.ix.Shutdown()
 }
 
 // TODO: dedupe this out into some testing utility package

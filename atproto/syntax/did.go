@@ -1,7 +1,7 @@
 package syntax
 
 import (
-	"fmt"
+	"errors"
 	"regexp"
 	"strings"
 )
@@ -13,13 +13,39 @@ import (
 // Syntax specification: https://atproto.com/specs/did
 type DID string
 
-func ParseDID(raw string) (DID, error) {
-	if len(raw) > 2*1024 {
-		return "", fmt.Errorf("DID is too long (2048 chars max)")
+var didRegex = regexp.MustCompile(`^did:[a-z]+:[a-zA-Z0-9._:%-]*[a-zA-Z0-9._-]$`)
+var plcChars = ""
+
+func isASCIIAlphaNum(c rune) bool {
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+		return true
 	}
-	var didRegex = regexp.MustCompile(`^did:[a-z]+:[a-zA-Z0-9._:%-]*[a-zA-Z0-9._-]$`)
+	return false
+}
+
+func ParseDID(raw string) (DID, error) {
+	// fast-path for did:plc, avoiding regex
+	if len(raw) == 32 && strings.HasPrefix(raw, "did:plc:") {
+		// NOTE: this doesn't really check base32, just broader alphanumberic. might pass invalid PLC DIDs, but they still have overall valid DID syntax
+		isPlc := true
+		for _, c := range raw[8:32] {
+			if !isASCIIAlphaNum(c) {
+				isPlc = false
+				break
+			}
+		}
+		if isPlc {
+			return DID(raw), nil
+		}
+	}
+	if raw == "" {
+		return "", errors.New("expected DID, got empty string")
+	}
+	if len(raw) > 2*1024 {
+		return "", errors.New("DID is too long (2048 chars max)")
+	}
 	if !didRegex.MatchString(raw) {
-		return "", fmt.Errorf("DID syntax didn't validate via regex")
+		return "", errors.New("DID syntax didn't validate via regex")
 	}
 	return DID(raw), nil
 }

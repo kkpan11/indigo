@@ -1,11 +1,13 @@
 package testing
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base32"
+	"encoding/json"
 	"fmt"
 	mathrand "math/rand"
 	"net"
@@ -115,7 +117,7 @@ func SetupPDS(ctx context.Context, suffix string, plc plc.PLCClient) (*TestPDS, 
 		return nil, err
 	}
 
-	cs, err := carstore.NewCarStore(cardb, cspath)
+	cs, err := carstore.NewCarStore(cardb, []string{cspath})
 	if err != nil {
 		return nil, err
 	}
@@ -162,12 +164,86 @@ func (tp *TestPDS) Run(t *testing.T) {
 	}
 }
 
-func (tp *TestPDS) RequestScraping(t *testing.T, b *TestBGS) {
+func (tp *TestPDS) RequestScraping(t *testing.T, b *TestRelay) {
 	t.Helper()
+
+	err := b.bgs.CreateAdminToken("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest("POST", "http://"+b.Host()+"/admin/subs/setPerDayLimit?limit=500", nil)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
+
+	// Send the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Check the response
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal("expected 200 OK, got: ", resp.Status)
+	}
 
 	c := &xrpc.Client{Host: "http://" + b.Host()}
 	if err := atproto.SyncRequestCrawl(context.TODO(), c, &atproto.SyncRequestCrawl_Input{Hostname: tp.RawHost()}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func (tp *TestPDS) BumpLimits(t *testing.T, b *TestRelay) {
+	t.Helper()
+
+	err := b.bgs.CreateAdminToken("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u, err := url.Parse(tp.HTTPHost())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	limReqBody := bgs.RateLimitChangeRequest{
+		Host: u.Host,
+		PDSRates: bgs.PDSRates{
+			PerSecond: 5_000,
+			PerHour:   100_000,
+			PerDay:    1_000_000,
+			RepoLimit: 500_000,
+			CrawlRate: 50_000,
+		},
+	}
+
+	// JSON encode the request body
+	reqBody, err := json.Marshal(limReqBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest("POST", "http://"+b.Host()+"/admin/pds/changeLimits", bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
+
+	// Send the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Check the response
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal("expected 200 OK, got: ", resp.Status)
 	}
 }
 
@@ -224,6 +300,74 @@ func (tp *TestPDS) NewUser(handle string) (*TestUser, error) {
 	}, nil
 }
 
+func (tp *TestPDS) TakedownRepo(t *testing.T, did string) {
+	req, err := http.NewRequest("GET", tp.HTTPHost()+"/takedownRepo?did="+did, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal("expected 200 OK, got: ", resp.Status)
+	}
+}
+
+func (tp *TestPDS) SuspendRepo(t *testing.T, did string) {
+	req, err := http.NewRequest("GET", tp.HTTPHost()+"/suspendRepo?did="+did, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal("expected 200 OK, got: ", resp.Status)
+	}
+}
+
+func (tp *TestPDS) DeactivateRepo(t *testing.T, did string) {
+	req, err := http.NewRequest("GET", tp.HTTPHost()+"/deactivateRepo?did="+did, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal("expected 200 OK, got: ", resp.Status)
+	}
+}
+
+func (tp *TestPDS) ReactivateRepo(t *testing.T, did string) {
+	req, err := http.NewRequest("GET", tp.HTTPHost()+"/reactivateRepo?did="+did, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal("expected 200 OK, got: ", resp.Status)
+	}
+}
+
 func (u *TestUser) Reply(t *testing.T, replyto, root *atproto.RepoStrongRef, body string) string {
 	t.Helper()
 
@@ -231,7 +375,7 @@ func (u *TestUser) Reply(t *testing.T, replyto, root *atproto.RepoStrongRef, bod
 	resp, err := atproto.RepoCreateRecord(ctx, u.client, &atproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.feed.post",
 		Repo:       u.did,
-		Record: &lexutil.LexiconTypeDecoder{&bsky.FeedPost{
+		Record: &lexutil.LexiconTypeDecoder{Val: &bsky.FeedPost{
 			CreatedAt: time.Now().Format(time.RFC3339),
 			Text:      body,
 			Reply: &bsky.FeedPost_ReplyRef{
@@ -258,7 +402,7 @@ func (u *TestUser) Post(t *testing.T, body string) *atproto.RepoStrongRef {
 	resp, err := atproto.RepoCreateRecord(ctx, u.client, &atproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.feed.post",
 		Repo:       u.did,
-		Record: &lexutil.LexiconTypeDecoder{&bsky.FeedPost{
+		Record: &lexutil.LexiconTypeDecoder{Val: &bsky.FeedPost{
 			CreatedAt: time.Now().Format(time.RFC3339),
 			Text:      body,
 		}},
@@ -281,7 +425,7 @@ func (u *TestUser) Like(t *testing.T, post *atproto.RepoStrongRef) {
 	_, err := atproto.RepoCreateRecord(ctx, u.client, &atproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.feed.vote",
 		Repo:       u.did,
-		Record: &lexutil.LexiconTypeDecoder{&bsky.FeedLike{
+		Record: &lexutil.LexiconTypeDecoder{Val: &bsky.FeedLike{
 			LexiconTypeID: "app.bsky.feed.vote",
 			CreatedAt:     time.Now().Format(time.RFC3339),
 			Subject:       post,
@@ -300,7 +444,7 @@ func (u *TestUser) Follow(t *testing.T, did string) string {
 	resp, err := atproto.RepoCreateRecord(ctx, u.client, &atproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.graph.follow",
 		Repo:       u.did,
-		Record: &lexutil.LexiconTypeDecoder{&bsky.GraphFollow{
+		Record: &lexutil.LexiconTypeDecoder{Val: &bsky.GraphFollow{
 			CreatedAt: time.Now().Format(time.RFC3339),
 			Subject:   did,
 		}},
@@ -329,7 +473,7 @@ func (u *TestUser) GetNotifs(t *testing.T) []*bsky.NotificationListNotifications
 	t.Helper()
 
 	ctx := context.TODO()
-	resp, err := bsky.NotificationListNotifications(ctx, u.client, "", 100, "")
+	resp, err := bsky.NotificationListNotifications(ctx, u.client, "", 100, false, nil, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,18 +492,6 @@ func (u *TestUser) ChangeHandle(t *testing.T, nhandle string) {
 	}
 }
 
-func (u *TestUser) DoRebase(t *testing.T) {
-	t.Helper()
-
-	ctx := context.TODO()
-	err := atproto.RepoRebaseRepo(ctx, u.client, &atproto.RepoRebaseRepo_Input{
-		Repo: u.did,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestPLC(t *testing.T) *plc.FakeDid {
 	// TODO: just do in memory...
 	tdir, err := os.MkdirTemp("", "plcserv")
@@ -374,24 +506,24 @@ func TestPLC(t *testing.T) *plc.FakeDid {
 	return plc.NewFakeDid(db)
 }
 
-type TestBGS struct {
+type TestRelay struct {
 	bgs *bgs.BGS
 	tr  *api.TestHandleResolver
 	db  *gorm.DB
 
-	// listener is owned by by the BGS structure and should be closed by
-	// shutting down the BGS.
+	// listener is owned by by the Relay structure and should be closed by
+	// shutting down the Relay.
 	listener net.Listener
 }
 
-func (t *TestBGS) Host() string {
+func (t *TestRelay) Host() string {
 	return t.listener.Addr().String()
 }
 
-func MustSetupBGS(t *testing.T, didr plc.PLCClient) *TestBGS {
+func MustSetupRelay(t *testing.T, didr plc.PLCClient, archive bool) *TestRelay {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	tbgs, err := SetupBGS(ctx, didr)
+	tbgs, err := SetupRelay(ctx, didr, archive)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +531,7 @@ func MustSetupBGS(t *testing.T, didr plc.PLCClient) *TestBGS {
 	return tbgs
 }
 
-func SetupBGS(ctx context.Context, didr plc.PLCClient) (*TestBGS, error) {
+func SetupRelay(ctx context.Context, didr plc.PLCClient, archive bool) (*TestRelay, error) {
 	dir, err := os.MkdirTemp("", "integtest")
 	if err != nil {
 		return nil, err
@@ -420,9 +552,19 @@ func SetupBGS(ctx context.Context, didr plc.PLCClient) (*TestBGS, error) {
 		return nil, err
 	}
 
-	cs, err := carstore.NewCarStore(cardb, cspath)
-	if err != nil {
-		return nil, err
+	var cs carstore.CarStore
+	if archive {
+		arccs, err := carstore.NewCarStore(cardb, []string{cspath})
+		if err != nil {
+			return nil, err
+		}
+		cs = arccs
+	} else {
+		nacs, err := carstore.NewNonArchivalCarstore(cardb)
+		if err != nil {
+			return nil, err
+		}
+		cs = nacs
 	}
 
 	//kmgr := indexer.NewKeyManager(didr, nil)
@@ -437,7 +579,7 @@ func SetupBGS(ctx context.Context, didr plc.PLCClient) (*TestBGS, error) {
 	diskpersist, err := events.NewDiskPersistence(filepath.Join(dir, "dp-primary"), filepath.Join(dir, "dp-archive"), maindb, opts)
 
 	evtman := events.NewEventManager(diskpersist)
-	rf := indexer.NewRepoFetcher(maindb, repoman)
+	rf := indexer.NewRepoFetcher(maindb, repoman, 10)
 
 	ix, err := indexer.NewIndexer(maindb, notifman, evtman, didr, rf, true, true, true)
 	if err != nil {
@@ -446,13 +588,15 @@ func SetupBGS(ctx context.Context, didr plc.PLCClient) (*TestBGS, error) {
 
 	repoman.SetEventHandler(func(ctx context.Context, evt *repomgr.RepoEvent) {
 		if err := ix.HandleRepoEvent(ctx, evt); err != nil {
-			fmt.Println("test bgs failed to handle repo event", err)
+			fmt.Println("test relay failed to handle repo event", err)
 		}
-	}, true) // TODO: actually want this to be false, but some tests use this to confirm the BGS has seen certain records
+	}, true) // TODO: actually want this to be false, but some tests use this to confirm the Relay has seen certain records
 
 	tr := &api.TestHandleResolver{}
 
-	b, err := bgs.NewBGS(maindb, ix, repoman, evtman, didr, nil, rf, tr, false)
+	bgsConfig := bgs.DefaultBGSConfig()
+	bgsConfig.SSL = false
+	b, err := bgs.NewBGS(maindb, ix, repoman, evtman, didr, rf, tr, bgsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +607,7 @@ func SetupBGS(ctx context.Context, didr plc.PLCClient) (*TestBGS, error) {
 		return nil, err
 	}
 
-	return &TestBGS{
+	return &TestRelay{
 		db:       maindb,
 		bgs:      b,
 		tr:       tr,
@@ -471,7 +615,7 @@ func SetupBGS(ctx context.Context, didr plc.PLCClient) (*TestBGS, error) {
 	}, nil
 }
 
-func (b *TestBGS) Run(t *testing.T) {
+func (b *TestRelay) Run(t *testing.T) {
 	go func() {
 		if err := b.bgs.StartWithListener(b.listener); err != nil {
 			fmt.Println(err)
@@ -480,7 +624,7 @@ func (b *TestBGS) Run(t *testing.T) {
 	time.Sleep(time.Millisecond * 10)
 }
 
-func (b *TestBGS) BanDomain(t *testing.T, d string) {
+func (b *TestRelay) BanDomain(t *testing.T, d string) {
 	t.Helper()
 
 	if err := b.db.Create(&models.DomainBan{
@@ -498,7 +642,7 @@ type EventStream struct {
 	Cur int
 }
 
-func (b *TestBGS) Events(t *testing.T, since int64) *EventStream {
+func (b *TestRelay) Events(t *testing.T, since int64) *EventStream {
 	d := websocket.Dialer{}
 	h := http.Header{}
 
@@ -543,9 +687,23 @@ func (b *TestBGS) Events(t *testing.T, since int64) *EventStream {
 				es.Lk.Unlock()
 				return nil
 			},
+			RepoIdentity: func(evt *atproto.SyncSubscribeRepos_Identity) error {
+				fmt.Println("received identity event: ", evt.Seq, evt.Did)
+				es.Lk.Lock()
+				es.Events = append(es.Events, &events.XRPCStreamEvent{RepoIdentity: evt})
+				es.Lk.Unlock()
+				return nil
+			},
+			RepoAccount: func(evt *atproto.SyncSubscribeRepos_Account) error {
+				fmt.Println("received account event: ", evt.Seq, evt.Did)
+				es.Lk.Lock()
+				es.Events = append(es.Events, &events.XRPCStreamEvent{RepoAccount: evt})
+				es.Lk.Unlock()
+				return nil
+			},
 		}
 		seqScheduler := sequential.NewScheduler("test", rsc.EventHandler)
-		if err := events.HandleRepoStream(ctx, con, seqScheduler); err != nil {
+		if err := events.HandleRepoStream(ctx, con, seqScheduler, nil); err != nil {
 			fmt.Println(err)
 		}
 	}()

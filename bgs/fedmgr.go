@@ -4,14 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/RussellLuo/slidingwindow"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/events"
-	"github.com/bluesky-social/indigo/events/schedulers/autoscaling"
+	"github.com/bluesky-social/indigo/events/schedulers/parallel"
 	"github.com/bluesky-social/indigo/models"
 	"go.opentelemetry.io/otel"
 	"golang.org/x/time/rate"
@@ -20,6 +22,8 @@ import (
 	pq "github.com/lib/pq"
 	"gorm.io/gorm"
 )
+
+var log = slog.Default().With("system", "bgs")
 
 type IndexCallback func(context.Context, *models.PDS, *events.XRPCStreamEvent) error
 
@@ -32,10 +36,18 @@ type Slurper struct {
 	lk     sync.Mutex
 	active map[string]*activeSub
 
-	LimitMux          sync.RWMutex
-	Limiters          map[uint]*rate.Limiter
-	DefaultLimit      rate.Limit
+	LimitMux              sync.RWMutex
+	Limiters              map[uint]*Limiters
+	DefaultPerSecondLimit int64
+	DefaultPerHourLimit   int64
+	DefaultPerDayLimit    int64
+
 	DefaultCrawlLimit rate.Limit
+	DefaultRepoLimit  int64
+	ConcurrencyPerPDS int64
+	MaxQueuePerPDS    int64
+
+	NewPDSPerDayLimiter *slidingwindow.Limiter
 
 	newSubsDisabled bool
 	trustedDomains  []string
@@ -46,17 +58,33 @@ type Slurper struct {
 	ssl bool
 }
 
+type Limiters struct {
+	PerSecond *slidingwindow.Limiter
+	PerHour   *slidingwindow.Limiter
+	PerDay    *slidingwindow.Limiter
+}
+
 type SlurperOptions struct {
-	SSL                bool
-	DefaultIngestLimit rate.Limit
-	DefaultCrawlLimit  rate.Limit
+	SSL                   bool
+	DefaultPerSecondLimit int64
+	DefaultPerHourLimit   int64
+	DefaultPerDayLimit    int64
+	DefaultCrawlLimit     rate.Limit
+	DefaultRepoLimit      int64
+	ConcurrencyPerPDS     int64
+	MaxQueuePerPDS        int64
 }
 
 func DefaultSlurperOptions() *SlurperOptions {
 	return &SlurperOptions{
-		SSL:                false,
-		DefaultIngestLimit: rate.Limit(50),
-		DefaultCrawlLimit:  rate.Limit(5),
+		SSL:                   false,
+		DefaultPerSecondLimit: 50,
+		DefaultPerHourLimit:   2500,
+		DefaultPerDayLimit:    20_000,
+		DefaultCrawlLimit:     rate.Limit(5),
+		DefaultRepoLimit:      100,
+		ConcurrencyPerPDS:     100,
+		MaxQueuePerPDS:        1_000,
 	}
 }
 
@@ -73,15 +101,20 @@ func NewSlurper(db *gorm.DB, cb IndexCallback, opts *SlurperOptions) (*Slurper, 
 	}
 	db.AutoMigrate(&SlurpConfig{})
 	s := &Slurper{
-		cb:                cb,
-		db:                db,
-		active:            make(map[string]*activeSub),
-		Limiters:          make(map[uint]*rate.Limiter),
-		DefaultLimit:      opts.DefaultIngestLimit,
-		DefaultCrawlLimit: opts.DefaultCrawlLimit,
-		ssl:               opts.SSL,
-		shutdownChan:      make(chan bool),
-		shutdownResult:    make(chan []error),
+		cb:                    cb,
+		db:                    db,
+		active:                make(map[string]*activeSub),
+		Limiters:              make(map[uint]*Limiters),
+		DefaultPerSecondLimit: opts.DefaultPerSecondLimit,
+		DefaultPerHourLimit:   opts.DefaultPerHourLimit,
+		DefaultPerDayLimit:    opts.DefaultPerDayLimit,
+		DefaultCrawlLimit:     opts.DefaultCrawlLimit,
+		DefaultRepoLimit:      opts.DefaultRepoLimit,
+		ConcurrencyPerPDS:     opts.ConcurrencyPerPDS,
+		MaxQueuePerPDS:        opts.MaxQueuePerPDS,
+		ssl:                   opts.SSL,
+		shutdownChan:          make(chan bool),
+		shutdownResult:        make(chan []error),
 	}
 	if err := s.loadConfig(); err != nil {
 		return nil, err
@@ -99,7 +132,7 @@ func NewSlurper(db *gorm.DB, cb IndexCallback, opts *SlurperOptions) (*Slurper, 
 				var errs []error
 				if errs = s.flushCursors(ctx); len(errs) > 0 {
 					for _, err := range errs {
-						log.Errorf("failed to flush cursors on shutdown: %s", err)
+						log.Error("failed to flush cursors on shutdown", "err", err)
 					}
 				}
 				log.Info("done flushing PDS cursors on shutdown")
@@ -112,7 +145,7 @@ func NewSlurper(db *gorm.DB, cb IndexCallback, opts *SlurperOptions) (*Slurper, 
 				defer span.End()
 				if errs := s.flushCursors(ctx); len(errs) > 0 {
 					for _, err := range errs {
-						log.Errorf("failed to flush cursors: %s", err)
+						log.Error("failed to flush cursors", "err", err)
 					}
 				}
 				log.Debug("done flushing PDS cursors")
@@ -123,28 +156,54 @@ func NewSlurper(db *gorm.DB, cb IndexCallback, opts *SlurperOptions) (*Slurper, 
 	return s, nil
 }
 
-func (s *Slurper) GetLimiter(pdsID uint) *rate.Limiter {
+func windowFunc() (slidingwindow.Window, slidingwindow.StopFunc) {
+	return slidingwindow.NewLocalWindow()
+}
+
+func (s *Slurper) GetLimiters(pdsID uint) *Limiters {
 	s.LimitMux.RLock()
 	defer s.LimitMux.RUnlock()
 	return s.Limiters[pdsID]
 }
 
-func (s *Slurper) GetOrCreateLimiter(pdsID uint, nlimit float64) *rate.Limiter {
+func (s *Slurper) GetOrCreateLimiters(pdsID uint, perSecLimit int64, perHourLimit int64, perDayLimit int64) *Limiters {
 	s.LimitMux.RLock()
 	defer s.LimitMux.RUnlock()
 	lim, ok := s.Limiters[pdsID]
 	if !ok {
-		lim = rate.NewLimiter(rate.Limit(nlimit), 1)
+		perSec, _ := slidingwindow.NewLimiter(time.Second, perSecLimit, windowFunc)
+		perHour, _ := slidingwindow.NewLimiter(time.Hour, perHourLimit, windowFunc)
+		perDay, _ := slidingwindow.NewLimiter(time.Hour*24, perDayLimit, windowFunc)
+		lim = &Limiters{
+			PerSecond: perSec,
+			PerHour:   perHour,
+			PerDay:    perDay,
+		}
 		s.Limiters[pdsID] = lim
 	}
 
 	return lim
 }
 
-func (s *Slurper) SetLimiter(pdsID uint, limiter *rate.Limiter) {
+func (s *Slurper) SetLimits(pdsID uint, perSecLimit int64, perHourLimit int64, perDayLimit int64) {
 	s.LimitMux.Lock()
 	defer s.LimitMux.Unlock()
-	s.Limiters[pdsID] = limiter
+	lim, ok := s.Limiters[pdsID]
+	if !ok {
+		perSec, _ := slidingwindow.NewLimiter(time.Second, perSecLimit, windowFunc)
+		perHour, _ := slidingwindow.NewLimiter(time.Hour, perHourLimit, windowFunc)
+		perDay, _ := slidingwindow.NewLimiter(time.Hour*24, perDayLimit, windowFunc)
+		lim = &Limiters{
+			PerSecond: perSec,
+			PerHour:   perHour,
+			PerDay:    perDay,
+		}
+		s.Limiters[pdsID] = lim
+	}
+
+	lim.PerSecond.SetLimit(perSecLimit)
+	lim.PerHour.SetLimit(perHourLimit)
+	lim.PerDay.SetLimit(perDayLimit)
 }
 
 // Shutdown shuts down the slurper
@@ -154,7 +213,7 @@ func (s *Slurper) Shutdown() []error {
 	errs := <-s.shutdownResult
 	if len(errs) > 0 {
 		for _, err := range errs {
-			log.Errorf("shutdown error: %s", err)
+			log.Error("shutdown error", "err", err)
 		}
 	}
 	log.Info("slurper shutdown complete")
@@ -176,14 +235,17 @@ func (s *Slurper) loadConfig() error {
 	s.newSubsDisabled = sc.NewSubsDisabled
 	s.trustedDomains = sc.TrustedDomains
 
+	s.NewPDSPerDayLimiter, _ = slidingwindow.NewLimiter(time.Hour*24, sc.NewPDSPerDayLimit, windowFunc)
+
 	return nil
 }
 
 type SlurpConfig struct {
 	gorm.Model
 
-	NewSubsDisabled bool
-	TrustedDomains  pq.StringArray `gorm:"type:text[]"`
+	NewSubsDisabled   bool
+	TrustedDomains    pq.StringArray `gorm:"type:text[]"`
+	NewPDSPerDayLimit int64
 }
 
 func (s *Slurper) SetNewSubsDisabled(dis bool) error {
@@ -202,6 +264,24 @@ func (s *Slurper) GetNewSubsDisabledState() bool {
 	s.lk.Lock()
 	defer s.lk.Unlock()
 	return s.newSubsDisabled
+}
+
+func (s *Slurper) SetNewPDSPerDayLimit(limit int64) error {
+	s.lk.Lock()
+	defer s.lk.Unlock()
+
+	if err := s.db.Model(SlurpConfig{}).Where("id = 1").Update("new_pds_per_day_limit", limit).Error; err != nil {
+		return err
+	}
+
+	s.NewPDSPerDayLimiter.SetLimit(limit)
+	return nil
+}
+
+func (s *Slurper) GetNewPDSPerDayLimit() int64 {
+	s.lk.Lock()
+	defer s.lk.Unlock()
+	return s.NewPDSPerDayLimiter.Limit()
 }
 
 func (s *Slurper) AddTrustedDomain(domain string) error {
@@ -260,6 +340,11 @@ var ErrNewSubsDisabled = fmt.Errorf("new subscriptions temporarily disabled")
 // Checks whether a host is allowed to be subscribed to
 // must be called with the slurper lock held
 func (s *Slurper) canSlurpHost(host string) bool {
+	// Check if we're over the limit for new PDSs today
+	if !s.NewPDSPerDayLimiter.Allow() {
+		return false
+	}
+
 	// Check if the host is a trusted domain
 	for _, d := range s.trustedDomains {
 		// If the domain starts with a *., it's a wildcard
@@ -278,14 +363,10 @@ func (s *Slurper) canSlurpHost(host string) bool {
 	return !s.newSubsDisabled
 }
 
-func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool) error {
+func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool, adminOverride bool, rateOverrides *PDSRates) error {
 	// TODO: for performance, lock on the hostname instead of global
 	s.lk.Lock()
 	defer s.lk.Unlock()
-
-	if !s.canSlurpHost(host) {
-		return ErrNewSubsDisabled
-	}
 
 	_, ok := s.active[host]
 	if ok {
@@ -302,13 +383,26 @@ func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool) err
 	}
 
 	if peering.ID == 0 {
+		if !adminOverride && !s.canSlurpHost(host) {
+			return ErrNewSubsDisabled
+		}
 		// New PDS!
 		npds := models.PDS{
-			Host:           host,
-			SSL:            s.ssl,
-			Registered:     reg,
-			RateLimit:      float64(s.DefaultLimit),
-			CrawlRateLimit: float64(s.DefaultCrawlLimit),
+			Host:             host,
+			SSL:              s.ssl,
+			Registered:       reg,
+			RateLimit:        float64(s.DefaultPerSecondLimit),
+			HourlyEventLimit: s.DefaultPerHourLimit,
+			DailyEventLimit:  s.DefaultPerDayLimit,
+			CrawlRateLimit:   float64(s.DefaultCrawlLimit),
+			RepoLimit:        s.DefaultRepoLimit,
+		}
+		if rateOverrides != nil {
+			npds.RateLimit = float64(rateOverrides.PerSecond)
+			npds.HourlyEventLimit = rateOverrides.PerHour
+			npds.DailyEventLimit = rateOverrides.PerDay
+			npds.CrawlRateLimit = float64(rateOverrides.CrawlRate)
+			npds.RepoLimit = rateOverrides.RepoLimit
 		}
 		if err := s.db.Create(&npds).Error; err != nil {
 			return err
@@ -332,7 +426,7 @@ func (s *Slurper) SubscribeToPds(ctx context.Context, host string, reg bool) err
 	}
 	s.active[host] = &sub
 
-	s.GetOrCreateLimiter(peering.ID, peering.RateLimit)
+	s.GetOrCreateLimiters(peering.ID, int64(peering.RateLimit), peering.HourlyEventLimit, peering.DailyEventLimit)
 
 	go s.subscribeWithRedialer(ctx, &peering, &sub)
 
@@ -360,7 +454,7 @@ func (s *Slurper) RestartAll() error {
 		s.active[pds.Host] = &sub
 
 		// Check if we've already got a limiter for this PDS
-		s.GetOrCreateLimiter(pds.ID, pds.RateLimit)
+		s.GetOrCreateLimiters(pds.ID, int64(pds.RateLimit), pds.HourlyEventLimit, pds.DailyEventLimit)
 		go s.subscribeWithRedialer(ctx, &pds, &sub)
 	}
 
@@ -384,7 +478,16 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 		protocol = "wss"
 	}
 
+	// Special case `.host.bsky.network` PDSs to rewind cursor by 200 events to smooth over unclean shutdowns
+	if strings.HasSuffix(host.Host, ".host.bsky.network") && host.Cursor > 200 {
+		host.Cursor -= 200
+	}
+
 	cursor := host.Cursor
+
+	connectedInbound.Inc()
+	defer connectedInbound.Dec()
+	// TODO:? maybe keep a gauge of 'in retry backoff' sources?
 
 	var backoff int
 	for {
@@ -397,14 +500,14 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 		url := fmt.Sprintf("%s://%s/xrpc/com.atproto.sync.subscribeRepos?cursor=%d", protocol, host.Host, cursor)
 		con, res, err := d.DialContext(ctx, url, nil)
 		if err != nil {
-			log.Warnw("dialing failed", "host", host.Host, "err", err, "backoff", backoff)
+			log.Warn("dialing failed", "pdsHost", host.Host, "err", err, "backoff", backoff)
 			time.Sleep(sleepForBackoff(backoff))
 			backoff++
 
 			if backoff > 15 {
-				log.Warnw("pds does not appear to be online, disabling for now", "host", host.Host)
+				log.Warn("pds does not appear to be online, disabling for now", "pdsHost", host.Host)
 				if err := s.db.Model(&models.PDS{}).Where("id = ?", host.ID).Update("registered", false).Error; err != nil {
-					log.Errorf("failed to unregister failing pds: %w", err)
+					log.Error("failed to unregister failing pds", "err", err)
 				}
 
 				return
@@ -413,14 +516,19 @@ func (s *Slurper) subscribeWithRedialer(ctx context.Context, host *models.PDS, s
 			continue
 		}
 
-		log.Info("event subscription response code: ", res.StatusCode)
+		log.Info("event subscription response", "code", res.StatusCode)
 
+		curCursor := cursor
 		if err := s.handleConnection(ctx, host, con, &cursor, sub); err != nil {
 			if errors.Is(err, ErrTimeoutShutdown) {
-				log.Infof("shutting down pds subscription to %s, no activity after %s", host.Host, EventsTimeout)
+				log.Info("shutting down pds subscription after timeout", "host", host.Host, "time", EventsTimeout)
 				return
 			}
-			log.Warnf("connection to %q failed: %s", host.Host, err)
+			log.Warn("connection to failed", "host", host.Host, "err", err)
+		}
+
+		if cursor > curCursor {
+			backoff = 0
 		}
 	}
 }
@@ -447,11 +555,11 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 
 	rsc := &events.RepoStreamCallbacks{
 		RepoCommit: func(evt *comatproto.SyncSubscribeRepos_Commit) error {
-			log.Debugw("got remote repo event", "host", host.Host, "repo", evt.Repo, "seq", evt.Seq)
+			log.Debug("got remote repo event", "pdsHost", host.Host, "repo", evt.Repo, "seq", evt.Seq)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoCommit: evt,
 			}); err != nil {
-				log.Errorf("failed handling event from %q (%d): %s", host.Host, evt.Seq, err)
+				log.Error("failed handling event", "host", host.Host, "seq", evt.Seq, "err", err)
 			}
 			*lastCursor = evt.Seq
 
@@ -462,11 +570,11 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			return nil
 		},
 		RepoHandle: func(evt *comatproto.SyncSubscribeRepos_Handle) error {
-			log.Infow("got remote handle update event", "host", host.Host, "did", evt.Did, "handle", evt.Handle)
+			log.Info("got remote handle update event", "pdsHost", host.Host, "did", evt.Did, "handle", evt.Handle)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoHandle: evt,
 			}); err != nil {
-				log.Errorf("failed handling event from %q (%d): %s", host.Host, evt.Seq, err)
+				log.Error("failed handling event", "host", host.Host, "seq", evt.Seq, "err", err)
 			}
 			*lastCursor = evt.Seq
 
@@ -477,11 +585,11 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			return nil
 		},
 		RepoMigrate: func(evt *comatproto.SyncSubscribeRepos_Migrate) error {
-			log.Infow("got remote repo migrate event", "host", host.Host, "did", evt.Did, "migrateTo", evt.MigrateTo)
+			log.Info("got remote repo migrate event", "pdsHost", host.Host, "did", evt.Did, "migrateTo", evt.MigrateTo)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoMigrate: evt,
 			}); err != nil {
-				log.Errorf("failed handling event from %q (%d): %s", host.Host, evt.Seq, err)
+				log.Error("failed handling event", "host", host.Host, "seq", evt.Seq, "err", err)
 			}
 			*lastCursor = evt.Seq
 
@@ -492,11 +600,11 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			return nil
 		},
 		RepoTombstone: func(evt *comatproto.SyncSubscribeRepos_Tombstone) error {
-			log.Infow("got remote repo tombstone event", "host", host.Host, "did", evt.Did)
+			log.Info("got remote repo tombstone event", "pdsHost", host.Host, "did", evt.Did)
 			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
 				RepoTombstone: evt,
 			}); err != nil {
-				log.Errorf("failed handling event from %q (%d): %s", host.Host, evt.Seq, err)
+				log.Error("failed handling event", "host", host.Host, "seq", evt.Seq, "err", err)
 			}
 			*lastCursor = evt.Seq
 
@@ -507,7 +615,37 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 			return nil
 		},
 		RepoInfo: func(info *comatproto.SyncSubscribeRepos_Info) error {
-			log.Infow("info event", "name", info.Name, "message", info.Message, "host", host.Host)
+			log.Info("info event", "name", info.Name, "message", info.Message, "pdsHost", host.Host)
+			return nil
+		},
+		RepoIdentity: func(ident *comatproto.SyncSubscribeRepos_Identity) error {
+			log.Info("identity event", "did", ident.Did)
+			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
+				RepoIdentity: ident,
+			}); err != nil {
+				log.Error("failed handling event", "host", host.Host, "seq", ident.Seq, "err", err)
+			}
+			*lastCursor = ident.Seq
+
+			if err := s.updateCursor(sub, *lastCursor); err != nil {
+				return fmt.Errorf("updating cursor: %w", err)
+			}
+
+			return nil
+		},
+		RepoAccount: func(acct *comatproto.SyncSubscribeRepos_Account) error {
+			log.Info("account event", "did", acct.Did, "status", acct.Status)
+			if err := s.cb(context.TODO(), host, &events.XRPCStreamEvent{
+				RepoAccount: acct,
+			}); err != nil {
+				log.Error("failed handling event", "host", host.Host, "seq", acct.Seq, "err", err)
+			}
+			*lastCursor = acct.Seq
+
+			if err := s.updateCursor(sub, *lastCursor); err != nil {
+				return fmt.Errorf("updating cursor: %w", err)
+			}
+
 			return nil
 		},
 		// TODO: all the other event types (handle change, migration, etc)
@@ -527,21 +665,23 @@ func (s *Slurper) handleConnection(ctx context.Context, host *models.PDS, con *w
 		},
 	}
 
-	limiter := s.GetOrCreateLimiter(host.ID, host.RateLimit)
+	lims := s.GetOrCreateLimiters(host.ID, int64(host.RateLimit), host.HourlyEventLimit, host.DailyEventLimit)
 
-	instrumentedRSC := events.NewInstrumentedRepoStreamCallbacks(limiter, rsc.EventHandler)
-
-	scalingSettings := autoscaling.AutoscaleSettings{
-		Concurrency:                 1,
-		MaxConcurrency:              360,
-		AutoscaleFrequency:          time.Second,
-		ThroughputBucketCount:       60,
-		ThroughputBucketDuration:    time.Second,
-		MaximumBufferedItemsPerRepo: 100,
+	limiters := []*slidingwindow.Limiter{
+		lims.PerSecond,
+		lims.PerHour,
+		lims.PerDay,
 	}
 
-	pool := autoscaling.NewScheduler(scalingSettings, con.RemoteAddr().String(), instrumentedRSC.EventHandler)
-	return events.HandleRepoStream(ctx, con, pool)
+	instrumentedRSC := events.NewInstrumentedRepoStreamCallbacks(limiters, rsc.EventHandler)
+
+	pool := parallel.NewScheduler(
+		100,
+		1_000,
+		con.RemoteAddr().String(),
+		instrumentedRSC.EventHandler,
+	)
+	return events.HandleRepoStream(ctx, con, pool, nil)
 }
 
 func (s *Slurper) updateCursor(sub *activeSub, curs int64) error {
@@ -612,6 +752,7 @@ func (s *Slurper) KillUpstreamConnection(host string, block bool) error {
 		return fmt.Errorf("killing connection %q: %w", host, ErrNoActiveConnection)
 	}
 	ac.cancel()
+	// cleanup in the run thread subscribeWithRedialer() will delete(s.active, host)
 
 	if block {
 		if err := s.db.Model(models.PDS{}).Where("id = ?", ac.pds.ID).UpdateColumn("blocked", true).Error; err != nil {

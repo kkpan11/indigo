@@ -2,7 +2,7 @@ package syntax
 
 import (
 	"encoding/base32"
-	"fmt"
+	"errors"
 	"regexp"
 	"strings"
 	"sync"
@@ -24,13 +24,17 @@ func Base32Sort() *base32.Encoding {
 // Syntax specification: https://atproto.com/specs/record-key
 type TID string
 
+var tidRegex = regexp.MustCompile(`^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$`)
+
 func ParseTID(raw string) (TID, error) {
-	if len(raw) != 13 {
-		return "", fmt.Errorf("TID is wrong length (expected 13 chars)")
+	if raw == "" {
+		return "", errors.New("expected TID, got empty string")
 	}
-	var tidRegex = regexp.MustCompile(`^[234567abcdefghij][234567abcdefghijklmnopqrstuvwxyz]{12}$`)
+	if len(raw) != 13 {
+		return "", errors.New("TID is wrong length (expected 13 chars)")
+	}
 	if !tidRegex.MatchString(raw) {
-		return "", fmt.Errorf("TID syntax didn't validate via regex")
+		return "", errors.New("TID syntax didn't validate via regex")
 	}
 	return TID(raw), nil
 }
