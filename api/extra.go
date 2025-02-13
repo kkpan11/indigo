@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,12 +15,9 @@ import (
 
 	"github.com/bluesky-social/indigo/did"
 	arc "github.com/hashicorp/golang-lru/arc/v2"
-	logging "github.com/ipfs/go-log"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	otel "go.opentelemetry.io/otel"
 )
-
-var log = logging.Logger("api")
 
 func ResolveDidToHandle(ctx context.Context, res did.Resolver, hr HandleResolver, udid string) (string, string, error) {
 	ctx, span := otel.Tracer("gosky").Start(ctx, "resolveDidToHandle")
@@ -78,18 +76,44 @@ type failCacheItem struct {
 }
 
 type ProdHandleResolver struct {
+	client    *http.Client
+	resolver  *net.Resolver
 	ReqMod    func(*http.Request, string) error
 	FailCache *arc.ARCCache[string, *failCacheItem]
 }
 
-func NewProdHandleResolver(failureCacheSize int) (*ProdHandleResolver, error) {
+func NewProdHandleResolver(failureCacheSize int, resolveAddr string, forceUDP bool) (*ProdHandleResolver, error) {
 	failureCache, err := arc.NewARC[string, *failCacheItem](failureCacheSize)
 	if err != nil {
 		return nil, err
 	}
 
+	if resolveAddr == "" {
+		resolveAddr = "1.1.1.1:53"
+	}
+
+	c := http.Client{
+		Transport: otelhttp.NewTransport(http.DefaultTransport),
+		Timeout:   time.Second * 10,
+	}
+
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: time.Second * 10,
+			}
+			if forceUDP {
+				network = "udp"
+			}
+			return d.DialContext(ctx, network, resolveAddr)
+		},
+	}
+
 	return &ProdHandleResolver{
 		FailCache: failureCache,
+		client:    &c,
+		resolver:  r,
 	}, nil
 }
 
@@ -168,10 +192,6 @@ func (dr *ProdHandleResolver) ResolveHandleToDid(ctx context.Context, handle str
 }
 
 func (dr *ProdHandleResolver) resolveWellKnown(ctx context.Context, handle string) (string, error) {
-	c := http.Client{
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
-	}
-
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://%s/.well-known/atproto-did", handle), nil)
 	if err != nil {
 		return "", err
@@ -185,7 +205,7 @@ func (dr *ProdHandleResolver) resolveWellKnown(ctx context.Context, handle strin
 
 	req = req.WithContext(ctx)
 
-	resp, err := c.Do(req)
+	resp, err := dr.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve handle (%s) through HTTP well-known route: %s", handle, err)
 	}
@@ -211,7 +231,7 @@ func (dr *ProdHandleResolver) resolveWellKnown(ctx context.Context, handle strin
 }
 
 func (dr *ProdHandleResolver) resolveDNS(ctx context.Context, handle string) (string, error) {
-	res, err := net.LookupTXT("_atproto." + handle)
+	res, err := dr.resolver.LookupTXT(ctx, "_atproto."+handle)
 	if err != nil {
 		return "", fmt.Errorf("handle lookup failed: %w", err)
 	}
@@ -248,12 +268,12 @@ func (tr *TestHandleResolver) ResolveHandleToDid(ctx context.Context, handle str
 
 		resp, err := c.Do(req)
 		if err != nil {
-			log.Warnf("failed to get did: %s", err)
+			slog.Warn("failed to resolve handle to DID", "handle", handle, "err", err)
 			continue
 		}
 
 		if resp.StatusCode != 200 {
-			log.Warnf("got non-200 status code while fetching did: %d", resp.StatusCode)
+			slog.Warn("got non-200 status code while resolving handle", "handle", handle, "statusCode", resp.StatusCode)
 			continue
 		}
 

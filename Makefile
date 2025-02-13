@@ -23,10 +23,9 @@ build: ## Build all executables
 	go build ./cmd/lexgen
 	go build ./cmd/stress
 	go build ./cmd/fakermaker
-	go build ./cmd/labelmaker
 	go build ./cmd/hepa
 	go build ./cmd/supercollider
-	go build -o ./sonar-cli ./cmd/sonar 
+	go build -o ./sonar-cli ./cmd/sonar
 	go build ./cmd/palomar
 
 .PHONY: all
@@ -44,6 +43,10 @@ test-short: ## Run tests, skipping slower integration tests
 test-interop: ## Run tests, including local interop (requires services running)
 	go clean -testcache && go test -tags=localinterop ./...
 
+.PHONY: test-search
+test-search: ## Run tests, including local search indexing (requires services running)
+	go clean -testcache && go test -tags=localsearch ./...
+
 .PHONY: coverage-html
 coverage-html: ## Generate test coverage report and open in browser
 	go test ./... -coverpkg=./... -coverprofile=test-coverage.out
@@ -51,7 +54,7 @@ coverage-html: ## Generate test coverage report and open in browser
 
 .PHONY: lint
 lint: ## Verify code style and run static checks
-	go vet -asmdecl -assign -atomic -bools -buildtag -cgocall -copylocks -httpresponse -loopclosure -lostcancel -nilfunc -printf -shift -stdmethods -structtag -tests -unmarshal -unreachable -unsafeptr -unusedresult ./...
+	go vet ./...
 	test -z $(gofmt -l ./...)
 
 .PHONY: fmt
@@ -64,8 +67,7 @@ check: ## Compile everything, checking syntax (does not output binaries)
 
 .PHONY: lexgen
 lexgen: ## Run codegen tool for lexicons (lexicon JSON to Go packages)
-	go run ./cmd/lexgen/ --package bsky --prefix app.bsky --outdir api/bsky $(LEXDIR)
-	go run ./cmd/lexgen/ --package atproto --prefix com.atproto --outdir api/atproto $(LEXDIR)
+	go run ./cmd/lexgen/ --build-file cmd/lexgen/bsky.json $(LEXDIR)
 
 .PHONY: cborgen
 cborgen: ## Run codegen tool for CBOR serialization
@@ -74,23 +76,34 @@ cborgen: ## Run codegen tool for CBOR serialization
 .env:
 	if [ ! -f ".env" ]; then cp example.dev.env .env; fi
 
-.PHONY: run-dev-bgs
-run-dev-bgs: .env ## Runs 'bigsky' BGS for local dev
-	GOLOG_LOG_LEVEL=info go run ./cmd/bigsky --admin-key localdev 
-# --crawl-insecure-ws 
+.PHONY: run-postgres
+run-postgres: .env ## Runs a local postgres instance
+	docker compose -f cmd/bigsky/docker-compose.yml up -d
 
-.PHONY: build-bgs-image
-build-bgs-image: ## Builds 'bigsky' BGS docker image
+.PHONY: run-dev-opensearch
+run-dev-opensearch: .env ## Runs a local opensearch instance
+	docker build -f cmd/palomar/Dockerfile.opensearch . -t opensearch-palomar
+	docker run -p 9200:9200 -p 9600:9600 -e "discovery.type=single-node" -e "plugins.security.disabled=true" -e "OPENSEARCH_INITIAL_ADMIN_PASSWORD=0penSearch-Pal0mar" opensearch-palomar
+
+.PHONY: run-dev-relay
+run-dev-relay: .env ## Runs 'bigsky' Relay for local dev
+	GOLOG_LOG_LEVEL=info go run ./cmd/bigsky --admin-key localdev
+# --crawl-insecure-ws
+
+.PHONY: build-relay-image
+build-relay-image: ## Builds 'bigsky' Relay docker image
 	docker build -t bigsky -f cmd/bigsky/Dockerfile .
 
-.PHONY: run-bgs-image
-run-bgs-image:
-	docker run -p 2470:2470 bigsky /bigsky --admin-key localdev
-# --crawl-insecure-ws 
+.PHONY: build-relay-ui
+build-relay-ui: ## Build Relay dash web app
+	cd ts/bgs-dash; yarn install --frozen-lockfile; yarn build
+	mkdir -p public
+	cp -r ts/bgs-dash/dist/* public/
 
-.PHONY: run-dev-labelmaker
-run-dev-labelmaker: .env ## Runs labelmaker for local dev
-	GOLOG_LOG_LEVEL=info go run ./cmd/labelmaker --subscribe-insecure-ws
+.PHONY: run-relay-image
+run-relay-image:
+	docker run -p 2470:2470 bigsky /bigsky --admin-key localdev
+# --crawl-insecure-ws
 
 .PHONY: run-dev-search
 run-dev-search: .env ## Runs search daemon for local dev
@@ -120,15 +133,11 @@ sc-fire: # Fires supercollider
 
 .PHONY: run-netsync
 run-netsync: .env ## Runs netsync for local dev
-	go run ./cmd/netsync --checkout-limit 30 --worker-count 60 --out-dir ../netsync-out
+	go run ./cmd/netsync --checkout-limit 100 --worker-count 100 --out-dir ../netsync-out
 
 SCYLLA_VERSION := latest
 SCYLLA_CPU := 0
 SCYLLA_NODES := 127.0.0.1:9042
-
-.PHONY: netsync-playback
-netsync-playback: .env ## Runs netsync for local dev
-	go run ./cmd/netsync --worker-count 96 --out-dir ../netsync-out_2023_08_25 playback --scylla-nodes $(SCYLLA_NODES)
 
 .PHONY: run-scylla
 run-scylla:

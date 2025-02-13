@@ -4,7 +4,7 @@ import Notification, {
   NotificationType,
 } from "../Notification/Notification";
 
-import { BGS_HOST } from "../../constants";
+import { RELAY_HOST } from "../../constants";
 
 import { useNavigate } from "react-router-dom";
 import ConfirmRepoTakedownModal from "./ConfirmRepoTakedownModal";
@@ -29,8 +29,8 @@ const Repos: FC<{}> = () => {
     repo: string;
     type: "takedown" | "untakedown";
   } | null>(null);
-  const [modalConfirm, setModalConfirm] = useState<() => void>(() => {});
-  const [modalCancel, setModalCancel] = useState<() => void>(() => {});
+  const [modalConfirm, setModalConfirm] = useState<() => void>(() => { });
+  const [modalCancel, setModalCancel] = useState<() => void>(() => { });
 
   const [adminToken, setAdminToken] = useState<string>(
     localStorage.getItem("admin_route_token") || ""
@@ -60,7 +60,7 @@ const Repos: FC<{}> = () => {
   }, []);
 
   const requestTakedownRepo = (repo: string) => {
-    fetch(`${BGS_HOST}/admin/repo/takeDown`, {
+    fetch(`${RELAY_HOST}/admin/repo/takeDown`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -92,7 +92,7 @@ const Repos: FC<{}> = () => {
   };
 
   const requestUntakedownRepo = (repo: string) => {
-    fetch(`${BGS_HOST}/admin/repo/reverseTakedown`, {
+    fetch(`${RELAY_HOST}/admin/repo/reverseTakedown`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -173,7 +173,7 @@ const Repos: FC<{}> = () => {
             Repo Takedowns
           </h1>
           <p className="mt-2 text-sm text-gray-700">
-            Takedown a repo to purge it from the BGS history and reject all
+            Takedown a repo to purge it from the Relay history and reject all
             future events for it.
           </p>
         </div>

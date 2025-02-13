@@ -13,26 +13,6 @@ import (
 	"github.com/bluesky-social/indigo/atproto/syntax"
 )
 
-type DIDDocument struct {
-	DID                syntax.DID              `json:"id"`
-	AlsoKnownAs        []string                `json:"alsoKnownAs,omitempty"`
-	VerificationMethod []DocVerificationMethod `json:"verificationMethod,omitempty"`
-	Service            []DocService            `json:"service,omitempty"`
-}
-
-type DocVerificationMethod struct {
-	ID                 string `json:"id"`
-	Type               string `json:"type"`
-	Controller         string `json:"controller"`
-	PublicKeyMultibase string `json:"publicKeyMultibase"`
-}
-
-type DocService struct {
-	ID              string `json:"id"`
-	Type            string `json:"type"`
-	ServiceEndpoint string `json:"serviceEndpoint"`
-}
-
 // WARNING: this does *not* bi-directionally verify account metadata; it only implements direct DID-to-DID-document lookup for the supported DID methods, and parses the resulting DID Doc into an Identity struct
 func (d *BaseDirectory) ResolveDID(ctx context.Context, did syntax.DID) (*DIDDocument, error) {
 	start := time.Now()
@@ -65,7 +45,6 @@ func (d *BaseDirectory) ResolveDIDWeb(ctx context.Context, did syntax.DID) (*DID
 		return nil, fmt.Errorf("did:web hostname has disallowed TLD: %s", hostname)
 	}
 
-	// TODO: use a more robust client
 	// TODO: allow ctx to specify unsafe http:// resolution, for testing?
 
 	if d.DIDWebLimitFunc != nil {
@@ -74,27 +53,33 @@ func (d *BaseDirectory) ResolveDIDWeb(ctx context.Context, did syntax.DID) (*DID
 		}
 	}
 
-	resp, err := http.Get("https://" + hostname + "/.well-known/did.json")
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+hostname+"/.well-known/did.json", nil)
+	if err != nil {
+		return nil, fmt.Errorf("constructing HTTP request for did:web resolution: %w", err)
+	}
+	resp, err := d.HTTPClient.Do(req)
+
 	// look for NXDOMAIN
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		if dnsErr.IsNotFound {
-			return nil, ErrDIDNotFound
+			return nil, fmt.Errorf("%w: DNS NXDOMAIN", ErrDIDNotFound)
 		}
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed HTTP fetch of did:web well-known document: %w", err)
+		return nil, fmt.Errorf("%w: did:web HTTP well-known fetch: %w", ErrDIDResolutionFailed, err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrDIDNotFound
+		return nil, fmt.Errorf("%w: did:web HTTP status 404", ErrDIDNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed did:web well-known fetch, HTTP status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("%w: did:web HTTP status %d", ErrDIDResolutionFailed, resp.StatusCode)
 	}
 
 	var doc DIDDocument
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		return nil, fmt.Errorf("failed parse of did:web document JSON: %w", err)
+		return nil, fmt.Errorf("%w: JSON DID document parse: %w", ErrDIDResolutionFailed, err)
 	}
 	return &doc, nil
 }
@@ -115,20 +100,25 @@ func (d *BaseDirectory) ResolveDIDPLC(ctx context.Context, did syntax.DID) (*DID
 		}
 	}
 
-	resp, err := http.Get(plcURL + "/" + did.String())
+	req, err := http.NewRequestWithContext(ctx, "GET", plcURL+"/"+did.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed did:plc directory resolution: %w", err)
+		return nil, fmt.Errorf("constructing HTTP request for did:plc resolution: %w", err)
 	}
+	resp, err := d.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: PLC directory lookup: %w", ErrDIDResolutionFailed, err)
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, ErrDIDNotFound
+		return nil, fmt.Errorf("%w: PLC directory 404", ErrDIDNotFound)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed did:web well-known fetch, HTTP status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("%w: PLC directory status %d", ErrDIDResolutionFailed, resp.StatusCode)
 	}
 
 	var doc DIDDocument
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		return nil, fmt.Errorf("failed parse of did:plc document JSON: %w", err)
+		return nil, fmt.Errorf("%w: JSON DID document parse: %w", ErrDIDResolutionFailed, err)
 	}
 	return &doc, nil
 }

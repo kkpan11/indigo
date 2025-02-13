@@ -66,7 +66,7 @@ var syncGetRepoCmd = &cli.Command{
 			xrpcc.Host = h
 		}
 
-		log.Infof("downloading from %s to: %s", xrpcc.Host, carPath)
+		log.Info("downloading", "from", xrpcc.Host, "to", carPath)
 		repoBytes, err := comatproto.SyncGetRepo(ctx, xrpcc, ident.DID.String(), "")
 		if err != nil {
 			return err
@@ -91,6 +91,27 @@ var syncGetRootCmd = &cli.Command{
 		}
 
 		ctx := context.TODO()
+
+		atid, err := syntax.ParseAtIdentifier(cctx.Args().First())
+		if err != nil {
+			return err
+		}
+
+		dir := identity.DefaultDirectory()
+		ident, err := dir.Lookup(ctx, *atid)
+		if err != nil {
+			return err
+		}
+
+		carPath := cctx.Args().Get(1)
+		if carPath == "" {
+			carPath = ident.DID.String() + ".car"
+		}
+
+		xrpcc.Host = ident.PDSEndpoint()
+		if xrpcc.Host == "" {
+			return fmt.Errorf("no PDS endpoint for identity")
+		}
 
 		root, err := comatproto.SyncGetHead(ctx, xrpcc, cctx.Args().First())
 		if err != nil {
