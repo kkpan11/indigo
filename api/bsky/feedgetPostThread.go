@@ -15,7 +15,8 @@ import (
 
 // FeedGetPostThread_Output is the output of a app.bsky.feed.getPostThread call.
 type FeedGetPostThread_Output struct {
-	Thread *FeedGetPostThread_Output_Thread `json:"thread" cborgen:"thread"`
+	Thread     *FeedGetPostThread_Output_Thread `json:"thread" cborgen:"thread"`
+	Threadgate *FeedDefs_ThreadgateView         `json:"threadgate,omitempty" cborgen:"threadgate,omitempty"`
 }
 
 type FeedGetPostThread_Output_Thread struct {
@@ -62,6 +63,10 @@ func (t *FeedGetPostThread_Output_Thread) UnmarshalJSON(b []byte) error {
 }
 
 // FeedGetPostThread calls the XRPC method "app.bsky.feed.getPostThread".
+//
+// depth: How many levels of reply depth should be included in response.
+// parentHeight: How many levels of parent (and grandparent, etc) post to include.
+// uri: Reference (AT-URI) to post record.
 func FeedGetPostThread(ctx context.Context, c *xrpc.Client, depth int64, parentHeight int64, uri string) (*FeedGetPostThread_Output, error) {
 	var out FeedGetPostThread_Output
 

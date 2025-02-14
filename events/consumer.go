@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"time"
 
+	"github.com/RussellLuo/slidingwindow"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	label "github.com/bluesky-social/indigo/api/label"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/time/rate"
 
 	"github.com/gorilla/websocket"
 )
@@ -18,11 +18,13 @@ import (
 type RepoStreamCallbacks struct {
 	RepoCommit    func(evt *comatproto.SyncSubscribeRepos_Commit) error
 	RepoHandle    func(evt *comatproto.SyncSubscribeRepos_Handle) error
+	RepoIdentity  func(evt *comatproto.SyncSubscribeRepos_Identity) error
+	RepoAccount   func(evt *comatproto.SyncSubscribeRepos_Account) error
 	RepoInfo      func(evt *comatproto.SyncSubscribeRepos_Info) error
 	RepoMigrate   func(evt *comatproto.SyncSubscribeRepos_Migrate) error
 	RepoTombstone func(evt *comatproto.SyncSubscribeRepos_Tombstone) error
-	LabelLabels   func(evt *label.SubscribeLabels_Labels) error
-	LabelInfo     func(evt *label.SubscribeLabels_Info) error
+	LabelLabels   func(evt *comatproto.LabelSubscribeLabels_Labels) error
+	LabelInfo     func(evt *comatproto.LabelSubscribeLabels_Info) error
 	Error         func(evt *ErrorFrame) error
 }
 
@@ -36,6 +38,10 @@ func (rsc *RepoStreamCallbacks) EventHandler(ctx context.Context, xev *XRPCStrea
 		return rsc.RepoInfo(xev.RepoInfo)
 	case xev.RepoMigrate != nil && rsc.RepoMigrate != nil:
 		return rsc.RepoMigrate(xev.RepoMigrate)
+	case xev.RepoIdentity != nil && rsc.RepoIdentity != nil:
+		return rsc.RepoIdentity(xev.RepoIdentity)
+	case xev.RepoAccount != nil && rsc.RepoAccount != nil:
+		return rsc.RepoAccount(xev.RepoAccount)
 	case xev.RepoTombstone != nil && rsc.RepoTombstone != nil:
 		return rsc.RepoTombstone(xev.RepoTombstone)
 	case xev.LabelLabels != nil && rsc.LabelLabels != nil:
@@ -50,19 +56,44 @@ func (rsc *RepoStreamCallbacks) EventHandler(ctx context.Context, xev *XRPCStrea
 }
 
 type InstrumentedRepoStreamCallbacks struct {
-	limiter *rate.Limiter
-	Next    func(ctx context.Context, xev *XRPCStreamEvent) error
+	limiters []*slidingwindow.Limiter
+	Next     func(ctx context.Context, xev *XRPCStreamEvent) error
 }
 
-func NewInstrumentedRepoStreamCallbacks(limiter *rate.Limiter, next func(ctx context.Context, xev *XRPCStreamEvent) error) *InstrumentedRepoStreamCallbacks {
+func NewInstrumentedRepoStreamCallbacks(limiters []*slidingwindow.Limiter, next func(ctx context.Context, xev *XRPCStreamEvent) error) *InstrumentedRepoStreamCallbacks {
 	return &InstrumentedRepoStreamCallbacks{
-		limiter: limiter,
-		Next:    next,
+		limiters: limiters,
+		Next:     next,
 	}
 }
 
+func waitForLimiter(ctx context.Context, lim *slidingwindow.Limiter) error {
+	if lim.Allow() {
+		return nil
+	}
+
+	// wait until the limiter is ready (check every 100ms)
+	t := time.NewTicker(100 * time.Millisecond)
+	defer t.Stop()
+
+	for !lim.Allow() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+
+	return nil
+}
+
 func (rsc *InstrumentedRepoStreamCallbacks) EventHandler(ctx context.Context, xev *XRPCStreamEvent) error {
-	rsc.limiter.Wait(ctx)
+	// Wait on all limiters before calling the next handler
+	for _, lim := range rsc.limiters {
+		if err := waitForLimiter(ctx, lim); err != nil {
+			return err
+		}
+	}
 	return rsc.Next(ctx, xev)
 }
 
@@ -78,7 +109,14 @@ func (sr *instrumentedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler) error {
+// HandleRepoStream
+// con is source of events
+// sched gets AddWork for each event
+// log may be nil for default logger
+func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler, log *slog.Logger) error {
+	if log == nil {
+		log = slog.Default().With("system", "events")
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer sched.Shutdown()
@@ -94,7 +132,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler)
 			select {
 			case <-t.C:
 				if err := con.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(time.Second*10)); err != nil {
-					log.Warnf("failed to ping: %s", err)
+					log.Warn("failed to ping", "err", err)
 				}
 			case <-ctx.Done():
 				con.Close()
@@ -115,7 +153,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler)
 
 	con.SetPongHandler(func(_ string) error {
 		if err := con.SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
-			log.Errorf("failed to set read deadline: %s", err)
+			log.Error("failed to set read deadline", "err", err)
 		}
 
 		return nil
@@ -164,7 +202,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler)
 				}
 
 				if evt.Seq < lastSeq {
-					log.Errorf("Got events out of order from stream (seq = %d, prev = %d)", evt.Seq, lastSeq)
+					log.Error("Got events out of order from stream", "seq", evt.Seq, "prev", lastSeq)
 				}
 
 				lastSeq = evt.Seq
@@ -181,12 +219,44 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler)
 				}
 
 				if evt.Seq < lastSeq {
-					log.Errorf("Got events out of order from stream (seq = %d, prev = %d)", evt.Seq, lastSeq)
+					log.Error("Got events out of order from stream", "seq", evt.Seq, "prev", lastSeq)
 				}
 				lastSeq = evt.Seq
 
 				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
 					RepoHandle: &evt,
+				}); err != nil {
+					return err
+				}
+			case "#identity":
+				var evt comatproto.SyncSubscribeRepos_Identity
+				if err := evt.UnmarshalCBOR(r); err != nil {
+					return err
+				}
+
+				if evt.Seq < lastSeq {
+					log.Error("Got events out of order from stream", "seq", evt.Seq, "prev", lastSeq)
+				}
+				lastSeq = evt.Seq
+
+				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
+					RepoIdentity: &evt,
+				}); err != nil {
+					return err
+				}
+			case "#account":
+				var evt comatproto.SyncSubscribeRepos_Account
+				if err := evt.UnmarshalCBOR(r); err != nil {
+					return err
+				}
+
+				if evt.Seq < lastSeq {
+					log.Error("Got events out of order from stream", "seq", evt.Seq, "prev", lastSeq)
+				}
+				lastSeq = evt.Seq
+
+				if err := sched.AddWork(ctx, evt.Did, &XRPCStreamEvent{
+					RepoAccount: &evt,
 				}); err != nil {
 					return err
 				}
@@ -209,7 +279,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler)
 				}
 
 				if evt.Seq < lastSeq {
-					log.Errorf("Got events out of order from stream (seq = %d, prev = %d)", evt.Seq, lastSeq)
+					log.Error("Got events out of order from stream", "seq", evt.Seq, "prev", lastSeq)
 				}
 				lastSeq = evt.Seq
 
@@ -225,7 +295,7 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler)
 				}
 
 				if evt.Seq < lastSeq {
-					log.Errorf("Got events out of order from stream (seq = %d, prev = %d)", evt.Seq, lastSeq)
+					log.Error("Got events out of order from stream", "seq", evt.Seq, "prev", lastSeq)
 				}
 				lastSeq = evt.Seq
 
@@ -234,14 +304,14 @@ func HandleRepoStream(ctx context.Context, con *websocket.Conn, sched Scheduler)
 				}); err != nil {
 					return err
 				}
-			case "#labebatch":
-				var evt label.SubscribeLabels_Labels
+			case "#labels":
+				var evt comatproto.LabelSubscribeLabels_Labels
 				if err := evt.UnmarshalCBOR(r); err != nil {
 					return fmt.Errorf("reading Labels event: %w", err)
 				}
 
 				if evt.Seq < lastSeq {
-					log.Errorf("Got events out of order from stream (seq = %d, prev = %d)", evt.Seq, lastSeq)
+					log.Error("Got events out of order from stream", "seq", evt.Seq, "prev", lastSeq)
 				}
 
 				lastSeq = evt.Seq

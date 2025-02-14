@@ -53,7 +53,7 @@ var bskyFollowCmd = &cli.Command{
 		resp, err := comatproto.RepoCreateRecord(context.TODO(), xrpcc, &comatproto.RepoCreateRecord_Input{
 			Collection: "app.bsky.graph.follow",
 			Repo:       xrpcc.Auth.Did,
-			Record:     &lexutil.LexiconTypeDecoder{&follow},
+			Record:     &lexutil.LexiconTypeDecoder{Val: &follow},
 		})
 		if err != nil {
 			return err
@@ -111,7 +111,7 @@ var bskyPostCmd = &cli.Command{
 		resp, err := comatproto.RepoCreateRecord(context.TODO(), xrpcc, &comatproto.RepoCreateRecord_Input{
 			Collection: "app.bsky.feed.post",
 			Repo:       auth.Did,
-			Record: &lexutil.LexiconTypeDecoder{&appbsky.FeedPost{
+			Record: &lexutil.LexiconTypeDecoder{Val: &appbsky.FeedPost{
 				Text:      text,
 				CreatedAt: time.Now().Format(util.ISO8601),
 			}},
@@ -178,7 +178,7 @@ var bskyGetFeedCmd = &cli.Command{
 				author = xrpcc.Auth.Did
 			}
 
-			tl, err := appbsky.FeedGetAuthorFeed(ctx, xrpcc, author, "", "", 99)
+			tl, err := appbsky.FeedGetAuthorFeed(ctx, xrpcc, author, "", "", false, 99)
 			if err != nil {
 				return err
 			}
@@ -314,11 +314,12 @@ var bskyDeletePostCmd = &cli.Command{
 			rkey = parts[1]
 		}
 
-		return comatproto.RepoDeleteRecord(context.TODO(), xrpcc, &comatproto.RepoDeleteRecord_Input{
+		_, err = comatproto.RepoDeleteRecord(context.TODO(), xrpcc, &comatproto.RepoDeleteRecord_Input{
 			Repo:       xrpcc.Auth.Did,
 			Collection: schema,
 			Rkey:       rkey,
 		})
+		return err
 	},
 }
 
@@ -334,7 +335,7 @@ var bskyNotificationsCmd = &cli.Command{
 			return err
 		}
 
-		notifs, err := appbsky.NotificationListNotifications(ctx, xrpcc, "", 50, "")
+		notifs, err := appbsky.NotificationListNotifications(ctx, xrpcc, "", 50, false, nil, "")
 		if err != nil {
 			return err
 		}

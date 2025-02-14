@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/syntax"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/hashicorp/golang-lru/v2/expirable"
 )
@@ -16,6 +14,7 @@ import (
 type CacheDirectory struct {
 	Inner             Directory
 	ErrTTL            time.Duration
+	InvalidHandleTTL  time.Duration
 	handleCache       *expirable.LRU[syntax.Handle, HandleEntry]
 	identityCache     *expirable.LRU[syntax.DID, IdentityEntry]
 	didLookupChans    sync.Map
@@ -34,45 +33,16 @@ type IdentityEntry struct {
 	Err      error
 }
 
-var handleCacheHits = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "atproto_directory_handle_cache_hits",
-	Help: "Number of cache hits for ATProto handle lookups",
-})
-
-var handleCacheMisses = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "atproto_directory_handle_cache_misses",
-	Help: "Number of cache misses for ATProto handle lookups",
-})
-
-var identityCacheHits = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "atproto_directory_identity_cache_hits",
-	Help: "Number of cache hits for ATProto identity lookups",
-})
-
-var identityCacheMisses = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "atproto_directory_identity_cache_misses",
-	Help: "Number of cache misses for ATProto identity lookups",
-})
-
-var identityRequestsCoalesced = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "atproto_directory_identity_requests_coalesced",
-	Help: "Number of identity requests coalesced",
-})
-
-var handleRequestsCoalesced = promauto.NewCounter(prometheus.CounterOpts{
-	Name: "atproto_directory_handle_requests_coalesced",
-	Help: "Number of handle requests coalesced",
-})
-
 var _ Directory = (*CacheDirectory)(nil)
 
 // Capacity of zero means unlimited size. Similarly, ttl of zero means unlimited duration.
-func NewCacheDirectory(inner Directory, capacity int, hitTTL, errTTL time.Duration) CacheDirectory {
+func NewCacheDirectory(inner Directory, capacity int, hitTTL, errTTL, invalidHandleTTL time.Duration) CacheDirectory {
 	return CacheDirectory{
-		ErrTTL:        errTTL,
-		Inner:         inner,
-		handleCache:   expirable.NewLRU[syntax.Handle, HandleEntry](capacity, nil, hitTTL),
-		identityCache: expirable.NewLRU[syntax.DID, IdentityEntry](capacity, nil, hitTTL),
+		ErrTTL:           errTTL,
+		InvalidHandleTTL: invalidHandleTTL,
+		Inner:            inner,
+		handleCache:      expirable.NewLRU[syntax.Handle, HandleEntry](capacity, nil, hitTTL),
+		identityCache:    expirable.NewLRU[syntax.DID, IdentityEntry](capacity, nil, hitTTL),
 	}
 }
 
@@ -87,10 +57,13 @@ func (d *CacheDirectory) IsIdentityStale(e *IdentityEntry) bool {
 	if e.Err != nil && time.Since(e.Updated) > d.ErrTTL {
 		return true
 	}
+	if e.Identity != nil && e.Identity.Handle.IsInvalidHandle() && time.Since(e.Updated) > d.InvalidHandleTTL {
+		return true
+	}
 	return false
 }
 
-func (d *CacheDirectory) updateHandle(ctx context.Context, h syntax.Handle) (*HandleEntry, error) {
+func (d *CacheDirectory) updateHandle(ctx context.Context, h syntax.Handle) HandleEntry {
 	ident, err := d.Inner.LookupHandle(ctx, h)
 	if err != nil {
 		he := HandleEntry{
@@ -99,7 +72,7 @@ func (d *CacheDirectory) updateHandle(ctx context.Context, h syntax.Handle) (*Ha
 			Err:     err,
 		}
 		d.handleCache.Add(h, he)
-		return &he, nil
+		return he
 	}
 
 	entry := IdentityEntry{
@@ -115,10 +88,13 @@ func (d *CacheDirectory) updateHandle(ctx context.Context, h syntax.Handle) (*Ha
 
 	d.identityCache.Add(ident.DID, entry)
 	d.handleCache.Add(ident.Handle, he)
-	return &he, nil
+	return he
 }
 
 func (d *CacheDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (syntax.DID, error) {
+	if h.IsInvalidHandle() {
+		return "", fmt.Errorf("can not resolve handle: %w", ErrInvalidHandle)
+	}
 	entry, ok := d.handleCache.Get(h)
 	if ok && !d.IsHandleStale(&entry) {
 		handleCacheHits.Inc()
@@ -145,21 +121,24 @@ func (d *CacheDirectory) ResolveHandle(ctx context.Context, h syntax.Handle) (sy
 		}
 	}
 
-	var did syntax.DID
 	// Update the Handle Entry from PLC and cache the result
-	newEntry, err := d.updateHandle(ctx, h)
-	if err == nil && newEntry != nil {
-		did = newEntry.DID
-	}
+	newEntry := d.updateHandle(ctx, h)
+
 	// Cleanup the coalesce map and close the results channel
 	d.handleLookupChans.Delete(h.String())
 	// Callers waiting will now get the result from the cache
 	close(res)
 
-	return did, err
+	if newEntry.Err != nil {
+		return "", newEntry.Err
+	}
+	if newEntry.DID != "" {
+		return newEntry.DID, nil
+	}
+	return "", fmt.Errorf("unexpected control-flow error")
 }
 
-func (d *CacheDirectory) updateDID(ctx context.Context, did syntax.DID) (*IdentityEntry, error) {
+func (d *CacheDirectory) updateDID(ctx context.Context, did syntax.DID) IdentityEntry {
 	ident, err := d.Inner.LookupDID(ctx, did)
 	// persist the identity lookup error, instead of processing it immediately
 	entry := IdentityEntry{
@@ -181,14 +160,19 @@ func (d *CacheDirectory) updateDID(ctx context.Context, did syntax.DID) (*Identi
 	if he != nil {
 		d.handleCache.Add(ident.Handle, *he)
 	}
-	return &entry, nil
+	return entry
 }
 
 func (d *CacheDirectory) LookupDID(ctx context.Context, did syntax.DID) (*Identity, error) {
+	id, _, err := d.LookupDIDWithCacheState(ctx, did)
+	return id, err
+}
+
+func (d *CacheDirectory) LookupDIDWithCacheState(ctx context.Context, did syntax.DID) (*Identity, bool, error) {
 	entry, ok := d.identityCache.Get(did)
 	if ok && !d.IsIdentityStale(&entry) {
 		identityCacheHits.Inc()
-		return entry.Identity, entry.Err
+		return entry.Identity, true, entry.Err
 	}
 	identityCacheMisses.Inc()
 
@@ -203,46 +187,55 @@ func (d *CacheDirectory) LookupDID(ctx context.Context, did syntax.DID) (*Identi
 			// The result should now be in the cache
 			entry, ok := d.identityCache.Get(did)
 			if ok && !d.IsIdentityStale(&entry) {
-				return entry.Identity, entry.Err
+				return entry.Identity, false, entry.Err
 			}
-			return nil, fmt.Errorf("identity not found in cache after coalesce returned")
+			return nil, false, fmt.Errorf("identity not found in cache after coalesce returned")
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
 	}
 
-	var doc *Identity
 	// Update the Identity Entry from PLC and cache the result
-	newEntry, err := d.updateDID(ctx, did)
-	if err == nil && newEntry != nil {
-		doc = newEntry.Identity
-	}
+	newEntry := d.updateDID(ctx, did)
+
 	// Cleanup the coalesce map and close the results channel
 	d.didLookupChans.Delete(did.String())
 	// Callers waiting will now get the result from the cache
 	close(res)
 
-	return doc, err
+	if newEntry.Err != nil {
+		return nil, false, newEntry.Err
+	}
+	if newEntry.Identity != nil {
+		return newEntry.Identity, false, nil
+	}
+	return nil, false, fmt.Errorf("unexpected control-flow error")
 }
 
 func (d *CacheDirectory) LookupHandle(ctx context.Context, h syntax.Handle) (*Identity, error) {
+	ident, _, err := d.LookupHandleWithCacheState(ctx, h)
+	return ident, err
+}
+
+func (d *CacheDirectory) LookupHandleWithCacheState(ctx context.Context, h syntax.Handle) (*Identity, bool, error) {
+	h = h.Normalize()
 	did, err := d.ResolveHandle(ctx, h)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	ident, err := d.LookupDID(ctx, did)
+	ident, hit, err := d.LookupDIDWithCacheState(ctx, did)
 	if err != nil {
-		return nil, err
+		return nil, hit, err
 	}
 
 	declared, err := ident.DeclaredHandle()
 	if err != nil {
-		return nil, err
+		return nil, hit, fmt.Errorf("could not verify handle/DID mapping: %w", err)
 	}
 	if declared != h {
-		return nil, fmt.Errorf("handle does not match that declared in DID document")
+		return nil, hit, fmt.Errorf("%w: %s != %s", ErrHandleMismatch, declared, h)
 	}
-	return ident, nil
+	return ident, hit, nil
 }
 
 func (d *CacheDirectory) Lookup(ctx context.Context, a syntax.AtIdentifier) (*Identity, error) {
@@ -260,6 +253,7 @@ func (d *CacheDirectory) Lookup(ctx context.Context, a syntax.AtIdentifier) (*Id
 func (d *CacheDirectory) Purge(ctx context.Context, a syntax.AtIdentifier) error {
 	handle, err := a.AsHandle()
 	if nil == err { // if not an error, is a handle
+		handle = handle.Normalize()
 		d.handleCache.Remove(handle)
 		return nil
 	}

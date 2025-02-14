@@ -80,7 +80,7 @@ func IngestRepo(ctx context.Context, bs blockstore.Blockstore, r io.Reader) (cid
 
 	br, err := car.NewBlockReader(r)
 	if err != nil {
-		return cid.Undef, err
+		return cid.Undef, fmt.Errorf("opening CAR block reader: %w", err)
 	}
 
 	for {
@@ -89,11 +89,11 @@ func IngestRepo(ctx context.Context, bs blockstore.Blockstore, r io.Reader) (cid
 			if err == io.EOF {
 				break
 			}
-			return cid.Undef, err
+			return cid.Undef, fmt.Errorf("reading block from CAR: %w", err)
 		}
 
 		if err := bs.Put(ctx, blk); err != nil {
-			return cid.Undef, err
+			return cid.Undef, fmt.Errorf("copying block to store: %w", err)
 		}
 	}
 
@@ -104,7 +104,7 @@ func ReadRepoFromCar(ctx context.Context, r io.Reader) (*Repo, error) {
 	bs := blockstore.NewBlockstore(datastore.NewMapDatastore())
 	root, err := IngestRepo(ctx, bs, r)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ReadRepoFromCar:IngestRepo: %w", err)
 	}
 
 	return OpenRepo(ctx, bs, root)
@@ -227,6 +227,30 @@ func (r *Repo) PutRecord(ctx context.Context, rpath string, rec CborMarshaler) (
 	return k, nil
 }
 
+func (r *Repo) UpdateRecord(ctx context.Context, rpath string, rec CborMarshaler) (cid.Cid, error) {
+	ctx, span := otel.Tracer("repo").Start(ctx, "UpdateRecord")
+	defer span.End()
+
+	r.dirty = true
+	t, err := r.getMst(ctx)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("failed to get mst: %w", err)
+	}
+
+	k, err := r.cst.Put(ctx, rec)
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	nmst, err := t.Update(ctx, rpath, k)
+	if err != nil {
+		return cid.Undef, fmt.Errorf("mst.Add failed: %w", err)
+	}
+
+	r.mst = nmst
+	return k, nil
+}
+
 func (r *Repo) DeleteRecord(ctx context.Context, rpath string) error {
 	ctx, span := otel.Tracer("repo").Start(ctx, "DeleteRecord")
 	defer span.End()
@@ -334,6 +358,27 @@ func (r *Repo) GetRecord(ctx context.Context, rpath string) (cid.Cid, cbg.CBORMa
 	ctx, span := otel.Tracer("repo").Start(ctx, "GetRecord")
 	defer span.End()
 
+	cc, recB, err := r.GetRecordBytes(ctx, rpath)
+	if err != nil {
+		return cid.Undef, nil, err
+	}
+
+	if recB == nil {
+		return cid.Undef, nil, fmt.Errorf("empty record bytes")
+	}
+
+	rec, err := lexutil.CborDecodeValue(*recB)
+	if err != nil {
+		return cid.Undef, nil, err
+	}
+
+	return cc, rec, nil
+}
+
+func (r *Repo) GetRecordBytes(ctx context.Context, rpath string) (cid.Cid, *[]byte, error) {
+	ctx, span := otel.Tracer("repo").Start(ctx, "GetRecordBytes")
+	defer span.End()
+
 	mst, err := r.getMst(ctx)
 	if err != nil {
 		return cid.Undef, nil, fmt.Errorf("getting repo mst: %w", err)
@@ -349,12 +394,9 @@ func (r *Repo) GetRecord(ctx context.Context, rpath string) (cid.Cid, cbg.CBORMa
 		return cid.Undef, nil, err
 	}
 
-	rec, err := lexutil.CborDecodeValue(blk.RawData())
-	if err != nil {
-		return cid.Undef, nil, err
-	}
+	raw := blk.RawData()
 
-	return cc, rec, nil
+	return cc, &raw, nil
 }
 
 func (r *Repo) DiffSince(ctx context.Context, oldrepo cid.Cid) ([]*mst.DiffOp, error) {

@@ -15,7 +15,7 @@ import (
 
 	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/models"
-	lru "github.com/hashicorp/golang-lru"
+	arc "github.com/hashicorp/golang-lru/arc/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	cbg "github.com/whyrusleeping/cbor-gen"
@@ -37,8 +37,8 @@ type DiskPersistence struct {
 
 	curSeq int64
 
-	uidCache *lru.ARCCache
-	didCache *lru.ARCCache
+	uidCache *arc.ARCCache[models.Uid, string] // TODO: unused
+	didCache *arc.ARCCache[string, models.Uid]
 
 	writers *sync.Pool
 	buffers *sync.Pool
@@ -81,8 +81,8 @@ type DiskPersistOptions struct {
 func DefaultDiskPersistOptions() *DiskPersistOptions {
 	return &DiskPersistOptions{
 		EventsPerFile:   10_000,
-		UIDCacheSize:    100_000,
-		DIDCacheSize:    100_000,
+		UIDCacheSize:    1_000_000,
+		DIDCacheSize:    1_000_000,
 		WriteBufferSize: 50,
 		Retention:       time.Hour * 24 * 3, // 3 days
 	}
@@ -93,12 +93,12 @@ func NewDiskPersistence(primaryDir, archiveDir string, db *gorm.DB, opts *DiskPe
 		opts = DefaultDiskPersistOptions()
 	}
 
-	uidCache, err := lru.NewARC(opts.UIDCacheSize)
+	uidCache, err := arc.NewARC[models.Uid, string](opts.UIDCacheSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create uid cache: %w", err)
 	}
 
-	didCache, err := lru.NewARC(opts.DIDCacheSize)
+	didCache, err := arc.NewARC[string, models.Uid](opts.DIDCacheSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create did cache: %w", err)
 	}
@@ -162,7 +162,7 @@ func (dp *DiskPersistence) resumeLog() error {
 		return dp.initLogFile()
 	}
 
-	// 0 for the mode is fine since thats only used if O_CREAT is passed
+	// 0 for the mode is fine since that is only used if O_CREAT is passed
 	fi, err := os.OpenFile(filepath.Join(dp.primaryDir, lfr.Path), os.O_RDWR, 0)
 	if err != nil {
 		return err
@@ -276,6 +276,8 @@ const (
 	evtKindCommit    = 1
 	evtKindHandle    = 2
 	evtKindTombstone = 3
+	evtKindIdentity  = 4
+	evtKindAccount   = 5
 )
 
 var emptyHeader = make([]byte, headerSize)
@@ -310,7 +312,7 @@ func (dp *DiskPersistence) flushRoutine() {
 			dp.lk.Lock()
 			if err := dp.flushLog(ctx); err != nil {
 				// TODO: this happening is quite bad. Need a recovery strategy
-				log.Errorf("failed to flush disk log: %s", err)
+				log.Error("failed to flush disk log", "err", err)
 			}
 			dp.lk.Unlock()
 		}
@@ -352,7 +354,7 @@ func (dp *DiskPersistence) garbageCollectRoutine() {
 		case <-t.C:
 			if errs := dp.garbageCollect(ctx); len(errs) > 0 {
 				for _, err := range errs {
-					log.Errorf("garbage collection error: %s", err)
+					log.Error("garbage collection error", "err", err)
 				}
 			}
 		}
@@ -428,7 +430,7 @@ func (dp *DiskPersistence) garbageCollect(ctx context.Context) []error {
 	refsGarbageCollected.WithLabelValues().Add(float64(refsDeleted))
 	filesGarbageCollected.WithLabelValues().Add(float64(filesDeleted))
 
-	log.Infow("garbage collection complete",
+	log.Info("garbage collection complete",
 		"filesDeleted", filesDeleted,
 		"refsDeleted", refsDeleted,
 		"oldRefsFound", oldRefsFound,
@@ -451,11 +453,15 @@ func (dp *DiskPersistence) doPersist(ctx context.Context, j persistJob) error {
 		e.RepoCommit.Seq = seq
 	case e.RepoHandle != nil:
 		e.RepoHandle.Seq = seq
+	case e.RepoIdentity != nil:
+		e.RepoIdentity.Seq = seq
+	case e.RepoAccount != nil:
+		e.RepoAccount.Seq = seq
 	case e.RepoTombstone != nil:
 		e.RepoTombstone.Seq = seq
 	default:
 		// only those three get peristed right now
-		// we shouldnt actually ever get here...
+		// we should not actually ever get here...
 		return nil
 	}
 
@@ -503,6 +509,18 @@ func (dp *DiskPersistence) Persist(ctx context.Context, e *XRPCStreamEvent) erro
 		evtKind = evtKindHandle
 		did = e.RepoHandle.Did
 		if err := e.RepoHandle.MarshalCBOR(cw); err != nil {
+			return fmt.Errorf("failed to marshal: %w", err)
+		}
+	case e.RepoIdentity != nil:
+		evtKind = evtKindIdentity
+		did = e.RepoIdentity.Did
+		if err := e.RepoIdentity.MarshalCBOR(cw); err != nil {
+			return fmt.Errorf("failed to marshal: %w", err)
+		}
+	case e.RepoAccount != nil:
+		evtKind = evtKindAccount
+		did = e.RepoAccount.Did
+		if err := e.RepoAccount.MarshalCBOR(cw); err != nil {
 			return fmt.Errorf("failed to marshal: %w", err)
 		}
 	case e.RepoTombstone != nil:
@@ -600,7 +618,7 @@ func (dp *DiskPersistence) writeHeader(ctx context.Context, flags uint32, kind u
 
 func (dp *DiskPersistence) uidForDid(ctx context.Context, did string) (models.Uid, error) {
 	if uid, ok := dp.didCache.Get(did); ok {
-		return uid.(models.Uid), nil
+		return uid, nil
 	}
 
 	var u models.ActorInfo
@@ -678,7 +696,7 @@ func (dp *DiskPersistence) readEventsFrom(ctx context.Context, since int64, fn s
 			return nil, err
 		}
 		if since > lastSeq {
-			log.Errorw("playback cursor is greater than last seq of file checked",
+			log.Error("playback cursor is greater than last seq of file checked",
 				"since", since,
 				"lastSeq", lastSeq,
 				"filename", fn,
@@ -732,6 +750,24 @@ func (dp *DiskPersistence) readEventsFrom(ctx context.Context, since int64, fn s
 			if err := cb(&XRPCStreamEvent{RepoHandle: &evt}); err != nil {
 				return nil, err
 			}
+		case evtKindIdentity:
+			var evt atproto.SyncSubscribeRepos_Identity
+			if err := evt.UnmarshalCBOR(io.LimitReader(bufr, h.Len64())); err != nil {
+				return nil, err
+			}
+			evt.Seq = h.Seq
+			if err := cb(&XRPCStreamEvent{RepoIdentity: &evt}); err != nil {
+				return nil, err
+			}
+		case evtKindAccount:
+			var evt atproto.SyncSubscribeRepos_Account
+			if err := evt.UnmarshalCBOR(io.LimitReader(bufr, h.Len64())); err != nil {
+				return nil, err
+			}
+			evt.Seq = h.Seq
+			if err := cb(&XRPCStreamEvent{RepoAccount: &evt}); err != nil {
+				return nil, err
+			}
 		case evtKindTombstone:
 			var evt atproto.SyncSubscribeRepos_Tombstone
 			if err := evt.UnmarshalCBOR(io.LimitReader(bufr, h.Len64())); err != nil {
@@ -742,7 +778,7 @@ func (dp *DiskPersistence) readEventsFrom(ctx context.Context, since int64, fn s
 				return nil, err
 			}
 		default:
-			log.Warnw("unrecognized event kind coming from log file", "seq", h.Seq, "kind", h.Kind)
+			log.Warn("unrecognized event kind coming from log file", "seq", h.Seq, "kind", h.Kind)
 			return nil, fmt.Errorf("halting on unrecognized event kind")
 		}
 	}

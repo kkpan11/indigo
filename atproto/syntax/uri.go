@@ -1,11 +1,11 @@
 package syntax
 
 import (
-	"fmt"
+	"errors"
 	"regexp"
 )
 
-// Represents an arbitary URI in string format, as would pass Lexicon syntax validation.
+// Represents an arbitrary URI in string format, as would pass Lexicon syntax validation.
 //
 // The syntax is minimal and permissive, designed for fast verification and exact-string passthrough, not schema-specific parsing or validation. For example, will not validate AT-URI or DID strings.
 //
@@ -13,12 +13,15 @@ import (
 type URI string
 
 func ParseURI(raw string) (URI, error) {
+	if raw == "" {
+		return "", errors.New("expected URI, got empty string")
+	}
 	if len(raw) > 8192 {
-		return "", fmt.Errorf("URI is too long (8192 chars max)")
+		return "", errors.New("URI is too long (8192 chars max)")
 	}
 	var uriRegex = regexp.MustCompile(`^[a-z][a-z.-]{0,80}:[[:graph:]]+$`)
 	if !uriRegex.MatchString(raw) {
-		return "", fmt.Errorf("URI syntax didn't validate via regex")
+		return "", errors.New("URI syntax didn't validate via regex")
 	}
 	return URI(raw), nil
 }

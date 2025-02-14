@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 	"github.com/bluesky-social/indigo/api/atproto"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/api/bsky"
+	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/events/schedulers/sequential"
@@ -25,10 +27,11 @@ import (
 	"github.com/bluesky-social/indigo/repo"
 	"github.com/bluesky-social/indigo/util"
 	"github.com/bluesky-social/indigo/util/cliutil"
+	"github.com/bluesky-social/indigo/xrpc"
 	"golang.org/x/time/rate"
 
 	"github.com/gorilla/websocket"
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
@@ -37,14 +40,13 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/carlmjohnson/versioninfo"
-	logging "github.com/ipfs/go-log"
 	"github.com/polydawn/refmt/cbor"
 	rejson "github.com/polydawn/refmt/json"
 	"github.com/polydawn/refmt/shared"
 	cli "github.com/urfave/cli/v2"
 )
 
-var log = logging.Logger("gosky")
+var log = slog.Default().With("system", "gosky")
 
 func main() {
 	run(os.Args)
@@ -78,6 +80,14 @@ func run(args []string) {
 			EnvVars: []string{"ATP_PLC_HOST"},
 		},
 	}
+
+	_, err := cliutil.SetupSlog(cliutil.LogOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logging setup error: %s\n", err.Error())
+		os.Exit(1)
+		return
+	}
+
 	app.Commands = []*cli.Command{
 		accountCmd,
 		adminCmd,
@@ -93,6 +103,7 @@ func run(args []string) {
 		listAllRecordsCmd,
 		readRepoStreamCmd,
 		parseRkey,
+		listLabelsCmd,
 	}
 
 	app.RunAndExitOnError()
@@ -118,7 +129,7 @@ func cborToJson(data []byte) ([]byte, error) {
 	enc := rejson.NewEncoder(buf, rejson.EncodeOptions{})
 
 	dec := cbor.NewDecoder(cbor.DecodeOptions{}, bytes.NewReader(data))
-	err := shared.TokenPump{dec, enc}.Run()
+	err := shared.TokenPump{TokenSource: dec, TokenSink: enc}.Run()
 	if err != nil {
 		return nil, err
 	}
@@ -186,11 +197,10 @@ var readRepoStreamCmd = &cli.Command{
 		hr := &api.ProdHandleResolver{}
 		resolveHandles := cctx.Bool("resolve-handles")
 
-		cache, _ := lru.New(10000)
+		cache, _ := lru.New[string, *cachedHandle](10000)
 		resolveDid := func(ctx context.Context, did string) (string, error) {
-			val, ok := cache.Get(did)
+			ch, ok := cache.Get(did)
 			if ok {
-				ch := val.(*cachedHandle)
 				if time.Now().Before(ch.Valid) {
 					return ch.Handle, nil
 				}
@@ -337,7 +347,7 @@ var readRepoStreamCmd = &cli.Command{
 			},
 		}
 		seqScheduler := sequential.NewScheduler(con.RemoteAddr().String(), rsc.EventHandler)
-		return events.HandleRepoStream(ctx, con, seqScheduler)
+		return events.HandleRepoStream(ctx, con, seqScheduler, log)
 	},
 }
 
@@ -434,6 +444,57 @@ var getRecordCmd = &cli.Command{
 
 			fmt.Println(string(b))
 			return nil
+		} else if strings.HasPrefix(cctx.Args().First(), "https://bsky.app") {
+			xrpcc, err := cliutil.GetXrpcClient(cctx, false)
+			if err != nil {
+				return err
+			}
+
+			parts := strings.Split(cctx.Args().First(), "/")
+			if len(parts) < 4 {
+				return fmt.Errorf("invalid post url")
+			}
+			rkey := parts[len(parts)-1]
+			did := parts[len(parts)-3]
+
+			var collection string
+			switch parts[len(parts)-2] {
+			case "post":
+				collection = "app.bsky.feed.post"
+			case "profile":
+				collection = "app.bsky.actor.profile"
+				did = rkey
+				rkey = "self"
+			case "feed":
+				collection = "app.bsky.feed.generator"
+			default:
+				return fmt.Errorf("unrecognized link")
+			}
+
+			atid, err := syntax.ParseAtIdentifier(did)
+			if err != nil {
+				return err
+			}
+
+			resp, err := identity.DefaultDirectory().Lookup(ctx, *atid)
+			if err != nil {
+				return err
+			}
+
+			xrpcc.Host = resp.PDSEndpoint()
+
+			out, err := comatproto.RepoGetRecord(ctx, xrpcc, "", collection, did, rkey)
+			if err != nil {
+				return err
+			}
+
+			b, err := json.MarshalIndent(out.Value.Val, "", "  ")
+			if err != nil {
+				return err
+			}
+
+			fmt.Println(string(b))
+			return nil
 		} else {
 			fb, err := os.ReadFile(rfi)
 			if err != nil {
@@ -450,7 +511,7 @@ var getRecordCmd = &cli.Command{
 
 		rc, rec, err := rr.GetRecord(ctx, cctx.Args().First())
 		if err != nil {
-			return err
+			return fmt.Errorf("get record failed: %w", err)
 		}
 
 		if cctx.Bool("raw") {
@@ -543,7 +604,7 @@ var createFeedGeneratorCmd = &cli.Command{
 
 		ctx := context.TODO()
 
-		rec := &lexutil.LexiconTypeDecoder{&bsky.FeedGenerator{
+		rec := &lexutil.LexiconTypeDecoder{Val: &bsky.FeedGenerator{
 			CreatedAt:   time.Now().Format(util.ISO8601),
 			Description: desc,
 			Did:         did,
@@ -703,6 +764,56 @@ var parseRkey = &cli.Command{
 			fmt.Println(tid.Time().Unix())
 		default:
 			return cli.Exit(fmt.Errorf("unknown format: %s", cctx.String("format")), 127)
+		}
+		return nil
+	},
+}
+
+var listLabelsCmd = &cli.Command{
+	Name:  "list-labels",
+	Usage: "list labels",
+	Flags: []cli.Flag{
+		&cli.DurationFlag{
+			Name:  "since",
+			Value: time.Hour,
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+
+		ctx := context.TODO()
+
+		delta := cctx.Duration("since")
+		since := time.Now().Add(-1 * delta).UnixMilli()
+
+		xrpcc := &xrpc.Client{
+			Host: "https://mod.bsky.app",
+		}
+
+		for {
+			out, err := atproto.TempFetchLabels(ctx, xrpcc, 100, since)
+			if err != nil {
+				return err
+			}
+
+			for _, l := range out.Labels {
+				b, err := json.MarshalIndent(l, "", "  ")
+				if err != nil {
+					return err
+				}
+
+				fmt.Println(string(b))
+			}
+
+			if len(out.Labels) > 0 {
+				last := out.Labels[len(out.Labels)-1]
+				dt, err := syntax.ParseDatetime(last.Cts)
+				if err != nil {
+					return fmt.Errorf("invalid cts: %w", err)
+				}
+				since = dt.Time().UnixMilli()
+			} else {
+				break
+			}
 		}
 		return nil
 	},
