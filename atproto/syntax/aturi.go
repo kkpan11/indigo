@@ -1,12 +1,13 @@
 package syntax
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 )
 
-var aturiRegex = regexp.MustCompile(`^at:\/\/(?P<authority>[a-zA-Z0-9._:%-]+)(\/(?P<collection>[a-zA-Z0-9-.]+)(\/(?P<rkey>[a-zA-Z0-9_~.-]{1,512}))?)?$`)
+var aturiRegex = regexp.MustCompile(`^at:\/\/(?P<authority>[a-zA-Z0-9._:%-]+)(\/(?P<collection>[a-zA-Z0-9-.]+)(\/(?P<rkey>[a-zA-Z0-9_~.:-]{1,512}))?)?$`)
 
 // String type which represents a syntaxtually valid AT URI, as would pass Lexicon syntax validation for the 'at-uri' field (no query or fragment parts)
 //
@@ -17,11 +18,11 @@ type ATURI string
 
 func ParseATURI(raw string) (ATURI, error) {
 	if len(raw) > 8192 {
-		return "", fmt.Errorf("ATURI is too long (8192 chars max)")
+		return "", errors.New("ATURI is too long (8192 chars max)")
 	}
 	parts := aturiRegex.FindStringSubmatch(raw)
 	if parts == nil || len(parts) < 2 || parts[0] == "" {
-		return "", fmt.Errorf("AT-URI syntax didn't validate via regex")
+		return "", errors.New("AT-URI syntax didn't validate via regex")
 	}
 	// verify authority as either a DID or NSID
 	_, err := ParseAtIdentifier(parts[1])

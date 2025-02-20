@@ -14,6 +14,7 @@ import Logout from "./components/Logout/Logout";
 import Domains from "./components/Domains/Domains";
 import Repos from "./components/Repos/Repos";
 import Consumers from "./components/Consumers/Consumers";
+import NewPDS from "./components/NewPDS/NewPDS";
 
 function classNames(...classes: string[]) {
   return classes.filter(Boolean).join(" ");
@@ -55,6 +56,20 @@ const routes: Route[] = [
       </RequireAuth>
     ),
     requrieAuth: true,
+  },
+  {
+    path: "/new_pds",
+    name: "New PDS",
+    element: (
+      <RequireAuth>
+        <Nav />
+        <main>
+          <div className="mx-auto max-w-7xl px-2 py-6 sm:px-6 lg:px-8">
+            <NewPDS />
+          </div>
+        </main>
+      </RequireAuth>
+    ),
   },
   {
     path: "/consumers",
@@ -101,6 +116,7 @@ const routes: Route[] = [
     ),
     requrieAuth: true,
   },
+
   {
     path: "/login",
     name: "Login",
@@ -148,17 +164,15 @@ function Nav() {
             <div className="flex h-16 items-center justify-between">
               <div className="flex items-center">
                 <div className="flex-shrink-0">
-                  <img
-                    className="h-8 w-8"
-                    src="https://tailwindui.com/img/logos/mark.svg?color=indigo&shade=500"
-                    alt="BGS Admin Dashboard"
-                  />
+                  <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" className="w-8 h-8 text-white">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125" />
+                  </svg>
                 </div>
                 <div className="hidden md:block">
                   <div className="ml-10 flex items-baseline space-x-4">
                     {routes.map((item) =>
                       (isAuthed && item.hideIfAuth) ||
-                      (!isAuthed && item.requrieAuth) ? null : (
+                        (!isAuthed && item.requrieAuth) ? null : (
                         <NavLink
                           key={item.path}
                           to={item.path || "/"}
@@ -204,7 +218,7 @@ function Nav() {
             <div className="space-y-1 px-2 pb-3 pt-2 sm:px-3">
               {routes.map((item) =>
                 (isAuthed && item.hideIfAuth) ||
-                (!isAuthed && item.requrieAuth) ? null : (
+                  (!isAuthed && item.requrieAuth) ? null : (
                   <Disclosure.Button
                     key={item.path}
                     className={classNames(

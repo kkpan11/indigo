@@ -31,7 +31,7 @@ func (t *CborChecker) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.Type (string) (string)
-	if len("$type") > cbg.MaxLength {
+	if len("$type") > 1000000 {
 		return xerrors.Errorf("Value in field \"$type\" was too long")
 	}
 
@@ -42,7 +42,7 @@ func (t *CborChecker) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.Type) > cbg.MaxLength {
+	if len(t.Type) > 1000000 {
 		return xerrors.Errorf("Value in field t.Type was too long")
 	}
 
@@ -78,26 +78,29 @@ func (t *CborChecker) UnmarshalCBOR(r io.Reader) (err error) {
 		return fmt.Errorf("CborChecker: map struct too large (%d)", extra)
 	}
 
-	var name string
 	n := extra
 
+	nameBuf := make([]byte, 5)
 	for i := uint64(0); i < n; i++ {
-
-		{
-			sval, err := cbg.ReadString(cr)
-			if err != nil {
-				return err
-			}
-
-			name = string(sval)
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
 		}
 
-		switch name {
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
 		// t.Type (string) (string)
 		case "$type":
 
 			{
-				sval, err := cbg.ReadString(cr)
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
 				if err != nil {
 					return err
 				}
@@ -107,7 +110,9 @@ func (t *CborChecker) UnmarshalCBOR(r io.Reader) (err error) {
 
 		default:
 			// Field doesn't exist on this type, so ignore it
-			cbg.ScanForLinks(r, func(cid.Cid) {})
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -126,7 +131,7 @@ func (t *LegacyBlob) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.Cid (string) (string)
-	if len("cid") > cbg.MaxLength {
+	if len("cid") > 1000000 {
 		return xerrors.Errorf("Value in field \"cid\" was too long")
 	}
 
@@ -137,7 +142,7 @@ func (t *LegacyBlob) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.Cid) > cbg.MaxLength {
+	if len(t.Cid) > 1000000 {
 		return xerrors.Errorf("Value in field t.Cid was too long")
 	}
 
@@ -149,7 +154,7 @@ func (t *LegacyBlob) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.MimeType (string) (string)
-	if len("mimeType") > cbg.MaxLength {
+	if len("mimeType") > 1000000 {
 		return xerrors.Errorf("Value in field \"mimeType\" was too long")
 	}
 
@@ -160,7 +165,7 @@ func (t *LegacyBlob) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.MimeType) > cbg.MaxLength {
+	if len(t.MimeType) > 1000000 {
 		return xerrors.Errorf("Value in field t.MimeType was too long")
 	}
 
@@ -196,26 +201,29 @@ func (t *LegacyBlob) UnmarshalCBOR(r io.Reader) (err error) {
 		return fmt.Errorf("LegacyBlob: map struct too large (%d)", extra)
 	}
 
-	var name string
 	n := extra
 
+	nameBuf := make([]byte, 8)
 	for i := uint64(0); i < n; i++ {
-
-		{
-			sval, err := cbg.ReadString(cr)
-			if err != nil {
-				return err
-			}
-
-			name = string(sval)
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
 		}
 
-		switch name {
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
 		// t.Cid (string) (string)
 		case "cid":
 
 			{
-				sval, err := cbg.ReadString(cr)
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
 				if err != nil {
 					return err
 				}
@@ -226,7 +234,7 @@ func (t *LegacyBlob) UnmarshalCBOR(r io.Reader) (err error) {
 		case "mimeType":
 
 			{
-				sval, err := cbg.ReadString(cr)
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
 				if err != nil {
 					return err
 				}
@@ -236,7 +244,9 @@ func (t *LegacyBlob) UnmarshalCBOR(r io.Reader) (err error) {
 
 		default:
 			// Field doesn't exist on this type, so ignore it
-			cbg.ScanForLinks(r, func(cid.Cid) {})
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -255,7 +265,7 @@ func (t *BlobSchema) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.Ref (util.LexLink) (struct)
-	if len("ref") > cbg.MaxLength {
+	if len("ref") > 1000000 {
 		return xerrors.Errorf("Value in field \"ref\" was too long")
 	}
 
@@ -271,7 +281,7 @@ func (t *BlobSchema) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.Size (int64) (int64)
-	if len("size") > cbg.MaxLength {
+	if len("size") > 1000000 {
 		return xerrors.Errorf("Value in field \"size\" was too long")
 	}
 
@@ -293,7 +303,7 @@ func (t *BlobSchema) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.LexiconTypeID (string) (string)
-	if len("$type") > cbg.MaxLength {
+	if len("$type") > 1000000 {
 		return xerrors.Errorf("Value in field \"$type\" was too long")
 	}
 
@@ -312,7 +322,7 @@ func (t *BlobSchema) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.MimeType (string) (string)
-	if len("mimeType") > cbg.MaxLength {
+	if len("mimeType") > 1000000 {
 		return xerrors.Errorf("Value in field \"mimeType\" was too long")
 	}
 
@@ -323,7 +333,7 @@ func (t *BlobSchema) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.MimeType) > cbg.MaxLength {
+	if len(t.MimeType) > 1000000 {
 		return xerrors.Errorf("Value in field t.MimeType was too long")
 	}
 
@@ -359,21 +369,24 @@ func (t *BlobSchema) UnmarshalCBOR(r io.Reader) (err error) {
 		return fmt.Errorf("BlobSchema: map struct too large (%d)", extra)
 	}
 
-	var name string
 	n := extra
 
+	nameBuf := make([]byte, 8)
 	for i := uint64(0); i < n; i++ {
-
-		{
-			sval, err := cbg.ReadString(cr)
-			if err != nil {
-				return err
-			}
-
-			name = string(sval)
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
 		}
 
-		switch name {
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
 		// t.Ref (util.LexLink) (struct)
 		case "ref":
 
@@ -388,10 +401,10 @@ func (t *BlobSchema) UnmarshalCBOR(r io.Reader) (err error) {
 		case "size":
 			{
 				maj, extra, err := cr.ReadHeader()
-				var extraI int64
 				if err != nil {
 					return err
 				}
+				var extraI int64
 				switch maj {
 				case cbg.MajUnsignedInt:
 					extraI = int64(extra)
@@ -414,7 +427,7 @@ func (t *BlobSchema) UnmarshalCBOR(r io.Reader) (err error) {
 		case "$type":
 
 			{
-				sval, err := cbg.ReadString(cr)
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
 				if err != nil {
 					return err
 				}
@@ -425,7 +438,7 @@ func (t *BlobSchema) UnmarshalCBOR(r io.Reader) (err error) {
 		case "mimeType":
 
 			{
-				sval, err := cbg.ReadString(cr)
+				sval, err := cbg.ReadStringWithMax(cr, 1000000)
 				if err != nil {
 					return err
 				}
@@ -435,7 +448,9 @@ func (t *BlobSchema) UnmarshalCBOR(r io.Reader) (err error) {
 
 		default:
 			// Field doesn't exist on this type, so ignore it
-			cbg.ScanForLinks(r, func(cid.Cid) {})
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
 		}
 	}
 

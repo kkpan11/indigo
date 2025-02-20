@@ -3,9 +3,9 @@ package pds
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/mail"
@@ -15,13 +15,13 @@ import (
 
 	"github.com/bluesky-social/indigo/api/atproto"
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	bsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/carstore"
 	"github.com/bluesky-social/indigo/events"
 	"github.com/bluesky-social/indigo/indexer"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
 	"github.com/bluesky-social/indigo/models"
 	"github.com/bluesky-social/indigo/notifs"
+	pdsdata "github.com/bluesky-social/indigo/pds/data"
 	"github.com/bluesky-social/indigo/plc"
 	"github.com/bluesky-social/indigo/repomgr"
 	"github.com/bluesky-social/indigo/util"
@@ -30,7 +30,6 @@ import (
 	gojwt "github.com/golang-jwt/jwt"
 	"github.com/gorilla/websocket"
 	"github.com/ipfs/go-cid"
-	logging "github.com/ipfs/go-log"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/lestrrat-go/jwx/v2/jwt"
@@ -38,11 +37,9 @@ import (
 	"gorm.io/gorm"
 )
 
-var log = logging.Logger("pds")
-
 type Server struct {
 	db             *gorm.DB
-	cs             *carstore.CarStore
+	cs             carstore.CarStore
 	repoman        *repomgr.RepoManager
 	feedgen        *FeedGenerator
 	notifman       notifs.NotificationManager
@@ -57,10 +54,9 @@ type Server struct {
 	serviceUrl   string
 
 	plc plc.PLCClient
-}
 
-const UserActorDeclCid = "bafyreid27zk7lbis4zw5fz4podbvbs4fc5ivwji3dmrwa6zggnj4bnd57u"
-const UserActorDeclType = "app.bsky.system.actorUser"
+	log *slog.Logger
+}
 
 // serverListenerBootTimeout is how long to wait for the requested server socket
 // to become available for use. This is an arbitrary timeout that should be safe
@@ -69,7 +65,7 @@ const UserActorDeclType = "app.bsky.system.actorUser"
 // NewServer.
 const serverListenerBootTimeout = 5 * time.Second
 
-func NewServer(db *gorm.DB, cs *carstore.CarStore, serkey *did.PrivKey, handleSuffix, serviceUrl string, didr plc.PLCClient, jwtkey []byte) (*Server, error) {
+func NewServer(db *gorm.DB, cs carstore.CarStore, serkey *did.PrivKey, handleSuffix, serviceUrl string, didr plc.PLCClient, jwtkey []byte) (*Server, error) {
 	db.AutoMigrate(&User{})
 	db.AutoMigrate(&Peering{})
 
@@ -80,7 +76,7 @@ func NewServer(db *gorm.DB, cs *carstore.CarStore, serkey *did.PrivKey, handleSu
 	repoman := repomgr.NewRepoManager(cs, kmgr)
 	notifman := notifs.NewNotificationManager(db, repoman.GetRecord)
 
-	rf := indexer.NewRepoFetcher(db, repoman)
+	rf := indexer.NewRepoFetcher(db, repoman, 10)
 
 	ix, err := indexer.NewIndexer(db, notifman, evtman, didr, rf, false, true, true)
 	if err != nil {
@@ -100,18 +96,20 @@ func NewServer(db *gorm.DB, cs *carstore.CarStore, serkey *did.PrivKey, handleSu
 		serviceUrl:     serviceUrl,
 		jwtSigningKey:  jwtkey,
 		enforcePeering: false,
+
+		log: slog.Default().With("system", "pds"),
 	}
 
 	repoman.SetEventHandler(func(ctx context.Context, evt *repomgr.RepoEvent) {
 		if err := ix.HandleRepoEvent(ctx, evt); err != nil {
-			log.Errorw("handle repo event failed", "user", evt.User, "err", err)
+			s.log.Error("handle repo event failed", "user", evt.User, "err", err)
 		}
 	}, true)
 
 	//ix.SendRemoteFollow = s.sendRemoteFollow
 	ix.CreateExternalUser = s.createExternalUser
 
-	feedgen, err := NewFeedGenerator(db, ix, s.readRecordFunc)
+	feedgen, err := NewFeedGenerator(db, ix, s.readRecordFunc, s.log)
 	if err != nil {
 		return nil, err
 	}
@@ -178,11 +176,11 @@ func (s *Server) createExternalUser(ctx context.Context, did string) (*models.Ac
 	if peering.ID == 0 {
 		cfg, err := atproto.ServerDescribeServer(ctx, c)
 		if err != nil {
-			// TODO: failing this shouldnt halt our indexing
+			// TODO: failing this should not halt our indexing
 			return nil, fmt.Errorf("failed to check unrecognized pds: %w", err)
 		}
 
-		// since handles can be anything, checking against this list doesnt matter...
+		// since handles can be anything, checking against this list does not matter...
 		_ = cfg
 
 		// TODO: could check other things, a valid response is good enough for now
@@ -203,15 +201,6 @@ func (s *Server) createExternalUser(ctx context.Context, did string) (*models.Ac
 		handle = hurl.Host
 	}
 
-	profile, err := bsky.ActorGetProfile(ctx, c, did)
-	if err != nil {
-		return nil, err
-	}
-
-	if handle != profile.Handle {
-		return nil, fmt.Errorf("mismatch in handle between did document and pds profile (%s != %s)", handle, profile.Handle)
-	}
-
 	// TODO: request this users info from their server to fill out our data...
 	u := User{
 		Handle: handle,
@@ -228,7 +217,7 @@ func (s *Server) createExternalUser(ctx context.Context, did string) (*models.Ac
 	subj := &models.ActorInfo{
 		Uid:         u.ID,
 		Handle:      sql.NullString{String: handle, Valid: true},
-		DisplayName: *profile.DisplayName,
+		DisplayName: "missing display name",
 		Did:         did,
 		Type:        "",
 		PDS:         peering.ID,
@@ -316,9 +305,6 @@ func (s *Server) RunAPIWithListener(listen net.Listener) error {
 				return true
 			case "/xrpc/com.atproto.server.describeServer":
 				return true
-			case "/xrpc/app.bsky.actor.getProfile":
-				fmt.Println("TODO: currently not requiring auth on get profile endpoint")
-				return true
 			case "/xrpc/com.atproto.sync.getRepo":
 				fmt.Println("TODO: currently not requiring auth on get repo endpoint")
 				return true
@@ -332,6 +318,14 @@ func (s *Server) RunAPIWithListener(listen net.Listener) error {
 				c.SetRequest(c.Request().WithContext(ctx))
 				return true
 			case "/.well-known/atproto-did":
+				return true
+			case "/takedownRepo":
+				return true
+			case "/suspendRepo":
+				return true
+			case "/deactivateRepo":
+				return true
+			case "/reactivateRepo":
 				return true
 			default:
 				return false
@@ -354,9 +348,65 @@ func (s *Server) RunAPIWithListener(listen net.Listener) error {
 		ctx.Response().WriteHeader(500)
 	}
 
+	e.GET("/takedownRepo", func(c echo.Context) error {
+		ctx := c.Request().Context()
+		did := c.QueryParam("did")
+		if did == "" {
+			return fmt.Errorf("missing did")
+		}
+
+		if err := s.TakedownRepo(ctx, did); err != nil {
+			return err
+		}
+
+		return c.String(200, "ok")
+	})
+
+	e.GET("/suspendRepo", func(c echo.Context) error {
+		ctx := c.Request().Context()
+		did := c.QueryParam("did")
+		if did == "" {
+			return fmt.Errorf("missing did")
+		}
+
+		if err := s.SuspendRepo(ctx, did); err != nil {
+			return err
+		}
+
+		return c.String(200, "ok")
+	})
+
+	e.GET("/deactivateRepo", func(c echo.Context) error {
+		ctx := c.Request().Context()
+		did := c.QueryParam("did")
+		if did == "" {
+			return fmt.Errorf("missing did")
+		}
+
+		if err := s.DeactivateRepo(ctx, did); err != nil {
+			return err
+		}
+
+		return c.String(200, "ok")
+	})
+
+	e.GET("/reactivateRepo", func(c echo.Context) error {
+		ctx := c.Request().Context()
+		did := c.QueryParam("did")
+		if did == "" {
+			return fmt.Errorf("missing did")
+		}
+
+		if err := s.ReactivateRepo(ctx, did); err != nil {
+			return err
+		}
+
+		return c.String(200, "ok")
+	})
+
 	e.Use(middleware.JWTWithConfig(cfg), s.userCheckMiddleware)
 	s.RegisterHandlersComAtproto(e)
-	s.RegisterHandlersAppBsky(e)
+
 	e.GET("/xrpc/com.atproto.sync.subscribeRepos", s.EventsHandler)
 	e.GET("/xrpc/_health", s.HandleHealthCheck)
 	e.GET("/.well-known/atproto-did", s.HandleResolveDid)
@@ -376,7 +426,7 @@ type HealthStatus struct {
 
 func (s *Server) HandleHealthCheck(c echo.Context) error {
 	if err := s.db.Exec("SELECT 1").Error; err != nil {
-		log.Errorf("healthcheck can't connect to database: %v", err)
+		s.log.Error("healthcheck can't connect to database", "err", err)
 		return c.JSON(500, HealthStatus{Status: "error", Message: "can't connect to database"})
 	} else {
 		return c.JSON(200, HealthStatus{Status: "ok"})
@@ -399,18 +449,7 @@ func (s *Server) HandleResolveDid(c echo.Context) error {
 	return c.String(200, u.Did)
 }
 
-type User struct {
-	ID          models.Uid `gorm:"primarykey"`
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	DeletedAt   gorm.DeletedAt `gorm:"index"`
-	Handle      string         `gorm:"uniqueIndex"`
-	Password    string
-	RecoveryKey string
-	Email       string
-	Did         string `gorm:"uniqueIndex"`
-	PDS         uint
-}
+type User = pdsdata.User
 
 type RefreshToken struct {
 	gorm.Model
@@ -543,15 +582,6 @@ func (s *Server) userCheckMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
-func (s *Server) handleAuth(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
-		authstr := c.Request().Header.Get("Authorization")
-		_ = authstr
-
-		return nil
-	}
-}
-
 func (s *Server) getUser(ctx context.Context) (*User, error) {
 	u, ok := ctx.Value("user").(*User)
 	if !ok {
@@ -561,15 +591,6 @@ func (s *Server) getUser(ctx context.Context) (*User, error) {
 	//u.Did = ctx.Value("did").(string)
 
 	return u, nil
-}
-
-func convertRecordTo(from any, to any) error {
-	b, err := json.Marshal(from)
-	if err != nil {
-		return err
-	}
-
-	return json.Unmarshal(b, to)
 }
 
 func validateEmail(email string) error {
@@ -597,12 +618,7 @@ func (s *Server) invalidateToken(ctx context.Context, u *User, tok *jwt.Token) e
 	panic("nyi")
 }
 
-type Peering struct {
-	gorm.Model
-	Host     string
-	Did      string
-	Approved bool
-}
+type Peering = pdsdata.Peering
 
 func (s *Server) EventsHandler(c echo.Context) error {
 	conn, err := websocket.Upgrade(c.Response().Writer, c.Request(), c.Response().Header(), 1<<10, 1<<10)
@@ -664,6 +680,12 @@ func (s *Server) EventsHandler(c echo.Context) error {
 		case evt.RepoHandle != nil:
 			header.MsgType = "#handle"
 			obj = evt.RepoHandle
+		case evt.RepoIdentity != nil:
+			header.MsgType = "#identity"
+			obj = evt.RepoIdentity
+		case evt.RepoAccount != nil:
+			header.MsgType = "#account"
+			obj = evt.RepoAccount
 		case evt.RepoInfo != nil:
 			header.MsgType = "#info"
 			obj = evt.RepoInfo
@@ -696,7 +718,7 @@ func (s *Server) EventsHandler(c echo.Context) error {
 func (s *Server) UpdateUserHandle(ctx context.Context, u *User, handle string) error {
 	if u.Handle == handle {
 		// no change? move on
-		log.Warnw("attempted to change handle to current handle", "did", u.Did, "handle", handle)
+		s.log.Warn("attempted to change handle to current handle", "did", u.Did, "handle", handle)
 		return nil
 	}
 
@@ -721,6 +743,80 @@ func (s *Server) UpdateUserHandle(ctx context.Context, u *User, handle string) e
 		RepoHandle: &comatproto.SyncSubscribeRepos_Handle{
 			Did:    u.Did,
 			Handle: handle,
+			Time:   time.Now().Format(util.ISO8601),
+		},
+	}); err != nil {
+		return fmt.Errorf("failed to push event: %s", err)
+	}
+
+	// Also push an Identity event
+	if err := s.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoIdentity: &comatproto.SyncSubscribeRepos_Identity{
+			Did:  u.Did,
+			Time: time.Now().Format(util.ISO8601),
+		},
+	}); err != nil {
+		return fmt.Errorf("failed to push event: %s", err)
+	}
+
+	return nil
+}
+
+func (s *Server) TakedownRepo(ctx context.Context, did string) error {
+	// Push an Account event
+	if err := s.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoAccount: &comatproto.SyncSubscribeRepos_Account{
+			Did:    did,
+			Active: false,
+			Status: &events.AccountStatusTakendown,
+			Time:   time.Now().Format(util.ISO8601),
+		},
+	}); err != nil {
+		return fmt.Errorf("failed to push event: %s", err)
+	}
+
+	return nil
+}
+
+func (s *Server) SuspendRepo(ctx context.Context, did string) error {
+	// Push an Account event
+	if err := s.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoAccount: &comatproto.SyncSubscribeRepos_Account{
+			Did:    did,
+			Active: false,
+			Status: &events.AccountStatusSuspended,
+			Time:   time.Now().Format(util.ISO8601),
+		},
+	}); err != nil {
+		return fmt.Errorf("failed to push event: %s", err)
+	}
+
+	return nil
+}
+
+func (s *Server) DeactivateRepo(ctx context.Context, did string) error {
+	// Push an Account event
+	if err := s.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoAccount: &comatproto.SyncSubscribeRepos_Account{
+			Did:    did,
+			Active: false,
+			Status: &events.AccountStatusDeactivated,
+			Time:   time.Now().Format(util.ISO8601),
+		},
+	}); err != nil {
+		return fmt.Errorf("failed to push event: %s", err)
+	}
+
+	return nil
+}
+
+func (s *Server) ReactivateRepo(ctx context.Context, did string) error {
+	// Push an Account event
+	if err := s.events.AddEvent(ctx, &events.XRPCStreamEvent{
+		RepoAccount: &comatproto.SyncSubscribeRepos_Account{
+			Did:    did,
+			Active: true,
+			Status: &events.AccountStatusActive,
 			Time:   time.Now().Format(util.ISO8601),
 		},
 	}); err != nil {

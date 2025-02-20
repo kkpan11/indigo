@@ -3,7 +3,9 @@ package indexer
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
+	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/models"
@@ -12,11 +14,14 @@ import (
 )
 
 type CrawlDispatcher struct {
+	// from Crawl()
 	ingest chan *models.ActorInfo
 
-	repoSync chan *crawlWork
-
+	// from AddToCatchupQueue()
 	catchup chan *crawlWork
+
+	// from main loop to fetchWorker()
+	repoSync chan *crawlWork
 
 	complete chan models.Uid
 
@@ -24,26 +29,40 @@ type CrawlDispatcher struct {
 	todo       map[models.Uid]*crawlWork
 	inProgress map[models.Uid]*crawlWork
 
-	doRepoCrawl func(context.Context, *crawlWork) error
+	repoFetcher CrawlRepoFetcher
 
 	concurrency int
+
+	log *slog.Logger
+
+	done chan struct{}
 }
 
-func NewCrawlDispatcher(repoFn func(context.Context, *crawlWork) error, concurrency int) (*CrawlDispatcher, error) {
+// this is what we need of RepoFetcher
+type CrawlRepoFetcher interface {
+	FetchAndIndexRepo(ctx context.Context, job *crawlWork) error
+}
+
+func NewCrawlDispatcher(repoFetcher CrawlRepoFetcher, concurrency int, log *slog.Logger) (*CrawlDispatcher, error) {
 	if concurrency < 1 {
 		return nil, fmt.Errorf("must specify a non-zero positive integer for crawl dispatcher concurrency")
 	}
 
-	return &CrawlDispatcher{
+	out := &CrawlDispatcher{
 		ingest:      make(chan *models.ActorInfo),
 		repoSync:    make(chan *crawlWork),
 		complete:    make(chan models.Uid),
 		catchup:     make(chan *crawlWork),
-		doRepoCrawl: repoFn,
+		repoFetcher: repoFetcher,
 		concurrency: concurrency,
 		todo:        make(map[models.Uid]*crawlWork),
 		inProgress:  make(map[models.Uid]*crawlWork),
-	}, nil
+		log:         log,
+		done:        make(chan struct{}),
+	}
+	go out.CatchupRepoGaugePoller()
+
+	return out, nil
 }
 
 func (c *CrawlDispatcher) Run() {
@@ -52,6 +71,10 @@ func (c *CrawlDispatcher) Run() {
 	for i := 0; i < c.concurrency; i++ {
 		go c.fetchWorker()
 	}
+}
+
+func (c *CrawlDispatcher) Shutdown() {
+	close(c.done)
 }
 
 type catchupJob struct {
@@ -173,13 +196,13 @@ func (c *CrawlDispatcher) dequeueJob(job *crawlWork) {
 }
 
 func (c *CrawlDispatcher) addToCatchupQueue(catchup *catchupJob) *crawlWork {
-	catchupEventsEnqueued.Inc()
 	c.maplk.Lock()
 	defer c.maplk.Unlock()
 
 	// If the actor crawl is enqueued, we can append to the catchup queue which gets emptied during the crawl
 	job, ok := c.todo[catchup.user.Uid]
 	if ok {
+		catchupEventsEnqueued.WithLabelValues("todo").Inc()
 		job.catchup = append(job.catchup, catchup)
 		return nil
 	}
@@ -187,10 +210,12 @@ func (c *CrawlDispatcher) addToCatchupQueue(catchup *catchupJob) *crawlWork {
 	// If the actor crawl is in progress, we can append to the nextr queue which gets emptied after the crawl
 	job, ok = c.inProgress[catchup.user.Uid]
 	if ok {
+		catchupEventsEnqueued.WithLabelValues("prog").Inc()
 		job.next = append(job.next, catchup)
 		return nil
 	}
 
+	catchupEventsEnqueued.WithLabelValues("new").Inc()
 	// Otherwise, we need to create a new crawl job for this actor and enqueue it
 	cw := &crawlWork{
 		act:     catchup.user,
@@ -204,8 +229,8 @@ func (c *CrawlDispatcher) fetchWorker() {
 	for {
 		select {
 		case job := <-c.repoSync:
-			if err := c.doRepoCrawl(context.TODO(), job); err != nil {
-				log.Errorf("failed to perform repo crawl of %q: %s", job.act.Did, err)
+			if err := c.repoFetcher.FetchAndIndexRepo(context.TODO(), job); err != nil {
+				c.log.Error("failed to perform repo crawl", "did", job.act.Did, "err", err)
 			}
 
 			// TODO: do we still just do this if it errors?
@@ -256,7 +281,7 @@ func (c *CrawlDispatcher) AddToCatchupQueue(ctx context.Context, host *models.PD
 	}
 }
 
-func (c *CrawlDispatcher) RepoInSlowPath(ctx context.Context, host *models.PDS, uid models.Uid) bool {
+func (c *CrawlDispatcher) RepoInSlowPath(ctx context.Context, uid models.Uid) bool {
 	c.maplk.Lock()
 	defer c.maplk.Unlock()
 	if _, ok := c.todo[uid]; ok {
@@ -268,4 +293,22 @@ func (c *CrawlDispatcher) RepoInSlowPath(ctx context.Context, host *models.PDS, 
 	}
 
 	return false
+}
+
+func (c *CrawlDispatcher) countReposInSlowPath() int {
+	c.maplk.Lock()
+	defer c.maplk.Unlock()
+	return len(c.inProgress) + len(c.todo)
+}
+
+func (c *CrawlDispatcher) CatchupRepoGaugePoller() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.done:
+		case <-ticker.C:
+			catchupReposGauge.Set(float64(c.countReposInSlowPath()))
+		}
+	}
 }

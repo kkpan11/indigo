@@ -1,11 +1,11 @@
 package syntax
 
 import (
-	"fmt"
+	"errors"
 	"regexp"
 )
 
-var recordKeyRegex = regexp.MustCompile(`^[a-zA-Z0-9_~.-]{1,512}$`)
+var recordKeyRegex = regexp.MustCompile(`^[a-zA-Z0-9_~.:-]{1,512}$`)
 
 // String type which represents a syntaxtually valid RecordKey identifier, as could be included in an AT URI
 //
@@ -15,14 +15,17 @@ var recordKeyRegex = regexp.MustCompile(`^[a-zA-Z0-9_~.-]{1,512}$`)
 type RecordKey string
 
 func ParseRecordKey(raw string) (RecordKey, error) {
+	if raw == "" {
+		return "", errors.New("expected record key, got empty string")
+	}
 	if len(raw) > 512 {
-		return "", fmt.Errorf("recordkey is too long (512 chars max)")
+		return "", errors.New("recordkey is too long (512 chars max)")
 	}
 	if raw == "" || raw == "." || raw == ".." {
-		return "", fmt.Errorf("recordkey can not be empty, '.', or '..'")
+		return "", errors.New("recordkey can not be empty, '.', or '..'")
 	}
 	if !recordKeyRegex.MatchString(raw) {
-		return "", fmt.Errorf("recordkey syntax didn't validate via regex")
+		return "", errors.New("recordkey syntax didn't validate via regex")
 	}
 	return RecordKey(raw), nil
 }

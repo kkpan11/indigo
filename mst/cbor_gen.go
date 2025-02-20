@@ -18,7 +18,7 @@ var _ = cid.Undef
 var _ = math.E
 var _ = sort.Sort
 
-func (t *nodeData) MarshalCBOR(w io.Writer) error {
+func (t *NodeData) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
@@ -30,8 +30,8 @@ func (t *nodeData) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	// t.Entries ([]mst.treeEntry) (slice)
-	if len("e") > cbg.MaxLength {
+	// t.Entries ([]mst.TreeEntry) (slice)
+	if len("e") > 1000000 {
 		return xerrors.Errorf("Value in field \"e\" was too long")
 	}
 
@@ -42,7 +42,7 @@ func (t *nodeData) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.Entries) > cbg.MaxLength {
+	if len(t.Entries) > 8192 {
 		return xerrors.Errorf("Slice value in field t.Entries was too long")
 	}
 
@@ -53,10 +53,11 @@ func (t *nodeData) MarshalCBOR(w io.Writer) error {
 		if err := v.MarshalCBOR(cw); err != nil {
 			return err
 		}
+
 	}
 
 	// t.Left (cid.Cid) (struct)
-	if len("l") > cbg.MaxLength {
+	if len("l") > 1000000 {
 		return xerrors.Errorf("Value in field \"l\" was too long")
 	}
 
@@ -80,8 +81,8 @@ func (t *nodeData) MarshalCBOR(w io.Writer) error {
 	return nil
 }
 
-func (t *nodeData) UnmarshalCBOR(r io.Reader) (err error) {
-	*t = nodeData{}
+func (t *NodeData) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = NodeData{}
 
 	cr := cbg.NewCborReader(r)
 
@@ -100,25 +101,28 @@ func (t *nodeData) UnmarshalCBOR(r io.Reader) (err error) {
 	}
 
 	if extra > cbg.MaxLength {
-		return fmt.Errorf("nodeData: map struct too large (%d)", extra)
+		return fmt.Errorf("NodeData: map struct too large (%d)", extra)
 	}
 
-	var name string
 	n := extra
 
+	nameBuf := make([]byte, 1)
 	for i := uint64(0); i < n; i++ {
-
-		{
-			sval, err := cbg.ReadString(cr)
-			if err != nil {
-				return err
-			}
-
-			name = string(sval)
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
 		}
 
-		switch name {
-		// t.Entries ([]mst.treeEntry) (slice)
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
+		// t.Entries ([]mst.TreeEntry) (slice)
 		case "e":
 
 			maj, extra, err = cr.ReadHeader()
@@ -126,7 +130,7 @@ func (t *nodeData) UnmarshalCBOR(r io.Reader) (err error) {
 				return err
 			}
 
-			if extra > cbg.MaxLength {
+			if extra > 8192 {
 				return fmt.Errorf("t.Entries: array too large (%d)", extra)
 			}
 
@@ -135,19 +139,28 @@ func (t *nodeData) UnmarshalCBOR(r io.Reader) (err error) {
 			}
 
 			if extra > 0 {
-				t.Entries = make([]treeEntry, extra)
+				t.Entries = make([]TreeEntry, extra)
 			}
 
 			for i := 0; i < int(extra); i++ {
+				{
+					var maj byte
+					var extra uint64
+					var err error
+					_ = maj
+					_ = extra
+					_ = err
 
-				var v treeEntry
-				if err := v.UnmarshalCBOR(cr); err != nil {
-					return err
+					{
+
+						if err := t.Entries[i].UnmarshalCBOR(cr); err != nil {
+							return xerrors.Errorf("unmarshaling t.Entries[i]: %w", err)
+						}
+
+					}
+
 				}
-
-				t.Entries[i] = v
 			}
-
 			// t.Left (cid.Cid) (struct)
 		case "l":
 
@@ -174,13 +187,15 @@ func (t *nodeData) UnmarshalCBOR(r io.Reader) (err error) {
 
 		default:
 			// Field doesn't exist on this type, so ignore it
-			cbg.ScanForLinks(r, func(cid.Cid) {})
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
 		}
 	}
 
 	return nil
 }
-func (t *treeEntry) MarshalCBOR(w io.Writer) error {
+func (t *TreeEntry) MarshalCBOR(w io.Writer) error {
 	if t == nil {
 		_, err := w.Write(cbg.CborNull)
 		return err
@@ -193,7 +208,7 @@ func (t *treeEntry) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.KeySuffix ([]uint8) (slice)
-	if len("k") > cbg.MaxLength {
+	if len("k") > 1000000 {
 		return xerrors.Errorf("Value in field \"k\" was too long")
 	}
 
@@ -204,7 +219,7 @@ func (t *treeEntry) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if len(t.KeySuffix) > cbg.ByteArrayMaxLen {
+	if len(t.KeySuffix) > 2097152 {
 		return xerrors.Errorf("Byte array in field t.KeySuffix was too long")
 	}
 
@@ -212,12 +227,12 @@ func (t *treeEntry) MarshalCBOR(w io.Writer) error {
 		return err
 	}
 
-	if _, err := cw.Write(t.KeySuffix[:]); err != nil {
+	if _, err := cw.Write(t.KeySuffix); err != nil {
 		return err
 	}
 
 	// t.PrefixLen (int64) (int64)
-	if len("p") > cbg.MaxLength {
+	if len("p") > 1000000 {
 		return xerrors.Errorf("Value in field \"p\" was too long")
 	}
 
@@ -239,7 +254,7 @@ func (t *treeEntry) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.Tree (cid.Cid) (struct)
-	if len("t") > cbg.MaxLength {
+	if len("t") > 1000000 {
 		return xerrors.Errorf("Value in field \"t\" was too long")
 	}
 
@@ -261,7 +276,7 @@ func (t *treeEntry) MarshalCBOR(w io.Writer) error {
 	}
 
 	// t.Val (cid.Cid) (struct)
-	if len("v") > cbg.MaxLength {
+	if len("v") > 1000000 {
 		return xerrors.Errorf("Value in field \"v\" was too long")
 	}
 
@@ -279,8 +294,8 @@ func (t *treeEntry) MarshalCBOR(w io.Writer) error {
 	return nil
 }
 
-func (t *treeEntry) UnmarshalCBOR(r io.Reader) (err error) {
-	*t = treeEntry{}
+func (t *TreeEntry) UnmarshalCBOR(r io.Reader) (err error) {
+	*t = TreeEntry{}
 
 	cr := cbg.NewCborReader(r)
 
@@ -299,24 +314,27 @@ func (t *treeEntry) UnmarshalCBOR(r io.Reader) (err error) {
 	}
 
 	if extra > cbg.MaxLength {
-		return fmt.Errorf("treeEntry: map struct too large (%d)", extra)
+		return fmt.Errorf("TreeEntry: map struct too large (%d)", extra)
 	}
 
-	var name string
 	n := extra
 
+	nameBuf := make([]byte, 1)
 	for i := uint64(0); i < n; i++ {
-
-		{
-			sval, err := cbg.ReadString(cr)
-			if err != nil {
-				return err
-			}
-
-			name = string(sval)
+		nameLen, ok, err := cbg.ReadFullStringIntoBuf(cr, nameBuf, 1000000)
+		if err != nil {
+			return err
 		}
 
-		switch name {
+		if !ok {
+			// Field doesn't exist on this type, so ignore it
+			if err := cbg.ScanForLinks(cr, func(cid.Cid) {}); err != nil {
+				return err
+			}
+			continue
+		}
+
+		switch string(nameBuf[:nameLen]) {
 		// t.KeySuffix ([]uint8) (slice)
 		case "k":
 
@@ -325,7 +343,7 @@ func (t *treeEntry) UnmarshalCBOR(r io.Reader) (err error) {
 				return err
 			}
 
-			if extra > cbg.ByteArrayMaxLen {
+			if extra > 2097152 {
 				return fmt.Errorf("t.KeySuffix: byte array too large (%d)", extra)
 			}
 			if maj != cbg.MajByteString {
@@ -336,17 +354,18 @@ func (t *treeEntry) UnmarshalCBOR(r io.Reader) (err error) {
 				t.KeySuffix = make([]uint8, extra)
 			}
 
-			if _, err := io.ReadFull(cr, t.KeySuffix[:]); err != nil {
+			if _, err := io.ReadFull(cr, t.KeySuffix); err != nil {
 				return err
 			}
+
 			// t.PrefixLen (int64) (int64)
 		case "p":
 			{
 				maj, extra, err := cr.ReadHeader()
-				var extraI int64
 				if err != nil {
 					return err
 				}
+				var extraI int64
 				switch maj {
 				case cbg.MajUnsignedInt:
 					extraI = int64(extra)
@@ -404,7 +423,9 @@ func (t *treeEntry) UnmarshalCBOR(r io.Reader) (err error) {
 
 		default:
 			// Field doesn't exist on this type, so ignore it
-			cbg.ScanForLinks(r, func(cid.Cid) {})
+			if err := cbg.ScanForLinks(r, func(cid.Cid) {}); err != nil {
+				return err
+			}
 		}
 	}
 

@@ -1,12 +1,15 @@
 package search
 
 import (
+	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
 	appbsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/identity"
-	"github.com/bluesky-social/indigo/util"
+	"github.com/bluesky-social/indigo/atproto/syntax"
+
 	"github.com/rivo/uniseg"
 )
 
@@ -19,6 +22,8 @@ type ProfileDoc struct {
 	Description *string  `json:"description,omitempty"`
 	ImgAltText  []string `json:"img_alt_text,omitempty"`
 	SelfLabel   []string `json:"self_label,omitempty"`
+	URL         []string `json:"url,omitempty"`
+	Domain      []string `json:"domain,omitempty"`
 	Tag         []string `json:"tag,omitempty"`
 	Emoji       []string `json:"emoji,omitempty"`
 	HasAvatar   bool     `json:"has_avatar"`
@@ -26,24 +31,26 @@ type ProfileDoc struct {
 }
 
 type PostDoc struct {
-	DocIndexTs      string   `json:"doc_index_ts"`
-	DID             string   `json:"did"`
-	RecordRkey      string   `json:"record_rkey"`
-	RecordCID       string   `json:"record_cid"`
-	CreatedAt       *string  `json:"created_at,omitempty"`
-	Text            string   `json:"text"`
-	LangCode        []string `json:"lang_code,omitempty"`
-	LangCodeIso2    []string `json:"lang_code_iso2,omitempty"`
-	MentionDID      []string `json:"mention_did,omitempty"`
-	LinkURL         []string `json:"link_url,omitempty"`
-	EmbedURL        *string  `json:"embed_url,omitempty"`
-	EmbedATURI      *string  `json:"embed_aturi,omitempty"`
-	ReplyRootATURI  *string  `json:"reply_root_aturi,omitempty"`
-	EmbedImgCount   int      `json:"embed_img_count"`
-	EmbedImgAltText []string `json:"embed_img_alt_text,omitempty"`
-	SelfLabel       []string `json:"self_label,omitempty"`
-	Tag             []string `json:"tag,omitempty"`
-	Emoji           []string `json:"emoji,omitempty"`
+	DocIndexTs        string   `json:"doc_index_ts"`
+	DID               string   `json:"did"`
+	RecordRkey        string   `json:"record_rkey"`
+	RecordCID         string   `json:"record_cid"`
+	CreatedAt         *string  `json:"created_at,omitempty"`
+	Text              string   `json:"text"`
+	TextJA            *string  `json:"text_ja,omitempty"`
+	LangCode          []string `json:"lang_code,omitempty"`
+	LangCodeIso2      []string `json:"lang_code_iso2,omitempty"`
+	MentionDID        []string `json:"mention_did,omitempty"`
+	EmbedATURI        *string  `json:"embed_aturi,omitempty"`
+	ReplyRootATURI    *string  `json:"reply_root_aturi,omitempty"`
+	EmbedImgCount     int      `json:"embed_img_count"`
+	EmbedImgAltText   []string `json:"embed_img_alt_text,omitempty"`
+	EmbedImgAltTextJA []string `json:"embed_img_alt_text_ja,omitempty"`
+	SelfLabel         []string `json:"self_label,omitempty"`
+	URL               []string `json:"url,omitempty"`
+	Domain            []string `json:"domain,omitempty"`
+	Tag               []string `json:"tag,omitempty"`
+	Emoji             []string `json:"emoji,omitempty"`
 }
 
 // Returns the search index document ID (`_id`) for this document.
@@ -80,7 +87,7 @@ func TransformProfile(profile *appbsky.ActorProfile, ident *identity.Identity, c
 		handle = ident.Handle.String()
 	}
 	return ProfileDoc{
-		DocIndexTs:  time.Now().UTC().Format(util.ISO8601),
+		DocIndexTs:  syntax.DatetimeNow().String(),
 		DID:         ident.DID.String(),
 		RecordCID:   cid,
 		Handle:      handle,
@@ -95,7 +102,7 @@ func TransformProfile(profile *appbsky.ActorProfile, ident *identity.Identity, c
 	}
 }
 
-func TransformPost(post *appbsky.FeedPost, ident *identity.Identity, rkey, cid string) PostDoc {
+func TransformPost(post *appbsky.FeedPost, did syntax.DID, rkey, cid string) PostDoc {
 	altText := []string{}
 	if post.Embed != nil && post.Embed.EmbedImages != nil {
 		for _, img := range post.Embed.EmbedImages.Images {
@@ -113,14 +120,14 @@ func TransformPost(post *appbsky.FeedPost, ident *identity.Identity, rkey, cid s
 		}
 	}
 	var mentionDIDs []string
-	var linkURLs []string
+	var urls []string
 	for _, facet := range post.Facets {
 		for _, feat := range facet.Features {
 			if feat.RichtextFacet_Mention != nil {
 				mentionDIDs = append(mentionDIDs, feat.RichtextFacet_Mention.Did)
 			}
 			if feat.RichtextFacet_Link != nil {
-				linkURLs = append(linkURLs, feat.RichtextFacet_Link.Uri)
+				urls = append(urls, feat.RichtextFacet_Link.Uri)
 			}
 		}
 	}
@@ -128,9 +135,8 @@ func TransformPost(post *appbsky.FeedPost, ident *identity.Identity, rkey, cid s
 	if post.Reply != nil {
 		replyRootATURI = &(post.Reply.Root.Uri)
 	}
-	var embedURL *string
 	if post.Embed != nil && post.Embed.EmbedExternal != nil {
-		embedURL = &post.Embed.EmbedExternal.External.Uri
+		urls = append(urls, post.Embed.EmbedExternal.External.Uri)
 	}
 	var embedATURI *string
 	if post.Embed != nil && post.Embed.EmbedRecord != nil {
@@ -139,16 +145,37 @@ func TransformPost(post *appbsky.FeedPost, ident *identity.Identity, rkey, cid s
 	if post.Embed != nil && post.Embed.EmbedRecordWithMedia != nil {
 		embedATURI = &post.Embed.EmbedRecordWithMedia.Record.Record.Uri
 	}
-	var embedImgCount int = 0
+	var embedImgCount int
 	var embedImgAltText []string
+	var embedImgAltTextJA []string
 	if post.Embed != nil && post.Embed.EmbedImages != nil {
 		embedImgCount = len(post.Embed.EmbedImages.Images)
 		for _, img := range post.Embed.EmbedImages.Images {
 			if img.Alt != "" {
 				embedImgAltText = append(embedImgAltText, img.Alt)
+				if containsJapanese(img.Alt) {
+					embedImgAltTextJA = append(embedImgAltTextJA, img.Alt)
+				}
 			}
 		}
 	}
+
+	if post.Embed != nil &&
+		post.Embed.EmbedRecordWithMedia != nil &&
+		post.Embed.EmbedRecordWithMedia.Media != nil &&
+		post.Embed.EmbedRecordWithMedia.Media.EmbedImages != nil &&
+		len(post.Embed.EmbedRecordWithMedia.Media.EmbedImages.Images) > 0 {
+		embedImgCount += len(post.Embed.EmbedRecordWithMedia.Media.EmbedImages.Images)
+		for _, img := range post.Embed.EmbedRecordWithMedia.Media.EmbedImages.Images {
+			if img.Alt != "" {
+				embedImgAltText = append(embedImgAltText, img.Alt)
+				if containsJapanese(img.Alt) {
+					embedImgAltTextJA = append(embedImgAltTextJA, img.Alt)
+				}
+			}
+		}
+	}
+
 	var selfLabels []string
 	if post.Labels != nil && post.Labels.LabelDefs_SelfLabels != nil {
 		for _, le := range post.Labels.LabelDefs_SelfLabels.Values {
@@ -156,28 +183,55 @@ func TransformPost(post *appbsky.FeedPost, ident *identity.Identity, rkey, cid s
 		}
 	}
 
+	var domains []string
+	for i, raw := range urls {
+		clean := NormalizeLossyURL(raw)
+		urls[i] = clean
+		u, err := url.Parse(clean)
+		if nil == err {
+			domains = append(domains, u.Hostname())
+		}
+	}
+
 	doc := PostDoc{
-		DocIndexTs:      time.Now().UTC().Format(util.ISO8601),
-		DID:             ident.DID.String(),
-		RecordRkey:      rkey,
-		RecordCID:       cid,
-		Text:            post.Text,
-		LangCode:        post.Langs,
-		LangCodeIso2:    langCodeIso2,
-		MentionDID:      mentionDIDs,
-		LinkURL:         linkURLs,
-		EmbedURL:        embedURL,
-		EmbedATURI:      embedATURI,
-		ReplyRootATURI:  replyRootATURI,
-		EmbedImgCount:   embedImgCount,
-		EmbedImgAltText: embedImgAltText,
-		SelfLabel:       selfLabels,
-		Tag:             parsePostTags(post),
-		Emoji:           parseEmojis(post.Text),
+		DocIndexTs:        syntax.DatetimeNow().String(),
+		DID:               did.String(),
+		RecordRkey:        rkey,
+		RecordCID:         cid,
+		Text:              post.Text,
+		LangCode:          post.Langs,
+		LangCodeIso2:      langCodeIso2,
+		MentionDID:        mentionDIDs,
+		EmbedATURI:        embedATURI,
+		ReplyRootATURI:    replyRootATURI,
+		EmbedImgCount:     embedImgCount,
+		EmbedImgAltText:   embedImgAltText,
+		EmbedImgAltTextJA: embedImgAltTextJA,
+		SelfLabel:         selfLabels,
+		URL:               urls,
+		Domain:            domains,
+		Tag:               parsePostTags(post),
+		Emoji:             parseEmojis(post.Text),
+	}
+
+	if containsJapanese(post.Text) {
+		doc.TextJA = &post.Text
 	}
 
 	if post.CreatedAt != "" {
-		doc.CreatedAt = &post.CreatedAt
+		// there are some old bad timestamps out there!
+		dt, err := syntax.ParseDatetimeLenient(post.CreatedAt)
+		if nil == err { // *not* an error
+			// not more than a few minutes in the future
+			if time.Since(dt.Time()) >= -1*5*time.Minute {
+				s := dt.String()
+				doc.CreatedAt = &s
+			} else {
+				slog.Warn("rejecting future post CreatedAt", "datetime", dt.String(), "did", did.String(), "rkey", rkey)
+				s := syntax.DatetimeNow().String()
+				doc.CreatedAt = &s
+			}
+		}
 	}
 
 	return doc
@@ -213,9 +267,7 @@ func parsePostTags(p *appbsky.FeedPost) []string {
 			}
 		}
 	}
-	for _, t := range p.Tags {
-		ret = append(ret, t)
-	}
+	ret = append(ret, p.Tags...)
 	if len(ret) == 0 {
 		return nil
 	}

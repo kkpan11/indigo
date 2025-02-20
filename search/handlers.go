@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	appbsky "github.com/bluesky-social/indigo/api/bsky"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -37,7 +39,7 @@ func parseCursorLimit(e echo.Context) (int, int, error) {
 	if offset > 10000 {
 		return 0, 0, &echo.HTTPError{
 			Code:    400,
-			Message: fmt.Sprintf("invalid value for 'cursor' (can't paginate so deep)"),
+			Message: "invalid value for 'cursor' (can't paginate so deep)",
 		}
 	}
 
@@ -76,6 +78,120 @@ func (s *Server) handleSearchPostsSkeleton(e echo.Context) error {
 		})
 	}
 
+	params := PostSearchParams{
+		Query: q,
+		// TODO: parse/validate the sort options here?
+		Sort:   e.QueryParam("sort"),
+		Domain: e.QueryParam("domain"),
+		URL:    e.QueryParam("url"),
+	}
+
+	viewerStr := e.QueryParam("viewer")
+	if viewerStr != "" {
+		d, err := syntax.ParseDID(viewerStr)
+		if err != nil {
+			return e.JSON(400, map[string]any{
+				"error":   "BadRequest",
+				"message": fmt.Sprintf("invalid DID for 'viewer': %s", err),
+			})
+		}
+		params.Viewer = &d
+	}
+	authorStr := e.QueryParam("author")
+	if authorStr != "" {
+		atid, err := syntax.ParseAtIdentifier(authorStr)
+		if err != nil {
+			return &echo.HTTPError{
+				Code:    400,
+				Message: fmt.Sprintf("invalid DID for 'author': %s", err),
+			}
+		}
+		if atid.IsHandle() {
+			ident, err := s.dir.Lookup(e.Request().Context(), *atid)
+			if err != nil {
+				return e.JSON(400, map[string]any{
+					"error":   "BadRequest",
+					"message": fmt.Sprintf("invalid Handle for 'author': %s", err),
+				})
+			}
+			params.Author = &ident.DID
+		} else {
+			d, err := atid.AsDID()
+			if err != nil {
+				return err
+			}
+			params.Author = &d
+		}
+	}
+
+	mentionsStr := e.QueryParam("mentions")
+	if mentionsStr != "" {
+		atid, err := syntax.ParseAtIdentifier(mentionsStr)
+		if err != nil {
+			return &echo.HTTPError{
+				Code:    400,
+				Message: fmt.Sprintf("invalid DID for 'mentions': %s", err),
+			}
+		}
+		if atid.IsHandle() {
+			ident, err := s.dir.Lookup(e.Request().Context(), *atid)
+			if err != nil {
+				return e.JSON(400, map[string]any{
+					"error":   "BadRequest",
+					"message": fmt.Sprintf("invalid Handle for 'mentions': %s", err),
+				})
+			}
+			params.Mentions = &ident.DID
+		} else {
+			d, err := atid.AsDID()
+			if err != nil {
+				return err
+			}
+			params.Mentions = &d
+		}
+	}
+
+	sinceStr := e.QueryParam("since")
+	if sinceStr != "" {
+		dt, err := syntax.ParseDatetime(sinceStr)
+		if err != nil {
+			return e.JSON(400, map[string]any{
+				"error":   "BadRequest",
+				"message": fmt.Sprintf("invalid Datetime for 'since': %s", err),
+			})
+		}
+		params.Since = &dt
+	}
+
+	untilStr := e.QueryParam("until")
+	if untilStr != "" {
+		dt, err := syntax.ParseDatetime(untilStr)
+		if err != nil {
+			return e.JSON(400, map[string]any{
+				"error":   "BadRequest",
+				"message": fmt.Sprintf("invalid Datetime for 'until': %s", err),
+			})
+		}
+		params.Until = &dt
+	}
+
+	langStr := e.QueryParam("lang")
+	if langStr != "" {
+		l, err := syntax.ParseLanguage(langStr)
+		if err != nil {
+			return e.JSON(400, map[string]any{
+				"error":   "BadRequest",
+				"message": fmt.Sprintf("invalid Language for 'lang': %s", err),
+			})
+		}
+		params.Lang = &l
+	}
+	// TODO: could be multiple tag params; guess we should "bind"?
+	tags := e.Request().URL.Query()["tags"]
+	if len(tags) > 0 {
+		params.Tags = tags
+	}
+
 	offset, limit, err := parseCursorLimit(e)
 	if err != nil {
 		span.SetAttributes(attribute.String("error", fmt.Sprintf("invalid cursor/limit: %s", err)))
@@ -83,9 +199,11 @@ func (s *Server) handleSearchPostsSkeleton(e echo.Context) error {
 		return err
 	}
 
+	params.Offset = offset
+	params.Size = limit
 	span.SetAttributes(attribute.Int("offset", offset), attribute.Int("limit", limit))
 
-	out, err := s.SearchPosts(ctx, q, offset, limit)
+	out, err := s.SearchPosts(ctx, &params)
 	if err != nil {
 		span.SetAttributes(attribute.String("error", fmt.Sprintf("failed to SearchPosts: %s", err)))
 		span.SetStatus(codes.Error, err.Error())
@@ -106,7 +224,8 @@ func (s *Server) handleSearchActorsSkeleton(e echo.Context) error {
 	q := strings.TrimSpace(e.QueryParam("q"))
 	if q == "" {
 		return e.JSON(400, map[string]any{
-			"error": "must pass non-empty search query",
+			"error":   "BadRequest",
+			"message": "must pass non-empty search query",
 		})
 	}
 
@@ -122,13 +241,32 @@ func (s *Server) handleSearchActorsSkeleton(e echo.Context) error {
 		typeahead = true
 	}
 
+	params := ActorSearchParams{
+		Query:     q,
+		Typeahead: typeahead,
+		Offset:    offset,
+		Size:      limit,
+	}
+
+	viewerStr := e.QueryParam("viewer")
+	if viewerStr != "" {
+		d, err := syntax.ParseDID(viewerStr)
+		if err != nil {
+			return e.JSON(400, map[string]any{
+				"error":   "BadRequest",
+				"message": fmt.Sprintf("invalid DID for 'viewer': %s", err),
+			})
+		}
+		params.Viewer = &d
+	}
+
 	span.SetAttributes(
 		attribute.Int("offset", offset),
 		attribute.Int("limit", limit),
 		attribute.Bool("typeahead", typeahead),
 	)
 
-	out, err := s.SearchProfiles(ctx, q, typeahead, offset, limit)
+	out, err := s.SearchProfiles(ctx, &params)
 	if err != nil {
 		span.SetAttributes(attribute.String("error", fmt.Sprintf("failed to SearchProfiles: %s", err)))
 		span.SetStatus(codes.Error, err.Error())
@@ -140,64 +278,11 @@ func (s *Server) handleSearchActorsSkeleton(e echo.Context) error {
 	return e.JSON(200, out)
 }
 
-type IndexError struct {
-	DID string `json:"did"`
-	Err string `json:"err"`
-}
-
-func (s *Server) handleIndexRepos(e echo.Context) error {
-	ctx, span := tracer.Start(e.Request().Context(), "handleIndexRepos")
-	defer span.End()
-
-	dids, ok := e.QueryParams()["did"]
-	if !ok {
-		return e.JSON(400, map[string]any{
-			"error": "must pass at least one did to index",
-		})
-	}
-
-	for _, did := range dids {
-		_, err := syntax.ParseDID(did)
-		if err != nil {
-			return e.JSON(400, map[string]any{
-				"error": fmt.Sprintf("invalid DID (%s): %s", did, err),
-			})
-		}
-	}
-
-	errs := []IndexError{}
-	successes := 0
-	skipped := 0
-	for _, did := range dids {
-		job, err := s.bfs.GetJob(ctx, did)
-		if job == nil && err == nil {
-			err := s.bfs.EnqueueJob(did)
-			if err != nil {
-				errs = append(errs, IndexError{
-					DID: did,
-					Err: err.Error(),
-				})
-				continue
-			}
-			successes++
-			continue
-		}
-		skipped++
-	}
-
-	return e.JSON(200, map[string]any{
-		"numEnqueued": successes,
-		"numSkipped":  skipped,
-		"numErrored":  len(errs),
-		"errors":      errs,
-	})
-}
-
-func (s *Server) SearchPosts(ctx context.Context, q string, offset, size int) (*appbsky.UnspeccedSearchPostsSkeleton_Output, error) {
+func (s *Server) SearchPosts(ctx context.Context, params *PostSearchParams) (*appbsky.UnspeccedSearchPostsSkeleton_Output, error) {
 	ctx, span := tracer.Start(ctx, "SearchPosts")
 	defer span.End()
 
-	resp, err := DoSearchPosts(ctx, s.dir, s.escli, s.postIndex, q, offset, size)
+	resp, err := DoSearchPosts(ctx, s.dir, s.escli, s.postIndex, params)
 	if err != nil {
 		return nil, err
 	}
@@ -220,8 +305,8 @@ func (s *Server) SearchPosts(ctx context.Context, q string, offset, size int) (*
 	}
 
 	out := appbsky.UnspeccedSearchPostsSkeleton_Output{Posts: posts}
-	if len(posts) == size && (offset+size) < 10000 {
-		s := fmt.Sprintf("%d", offset+size)
+	if len(posts) == params.Size && (params.Offset+params.Size) < 10000 {
+		s := fmt.Sprintf("%d", params.Offset+params.Size)
 		out.Cursor = &s
 	}
 	if resp.Hits.Total.Relation == "eq" {
@@ -231,23 +316,135 @@ func (s *Server) SearchPosts(ctx context.Context, q string, offset, size int) (*
 	return &out, nil
 }
 
-func (s *Server) SearchProfiles(ctx context.Context, q string, typeahead bool, offset, size int) (*appbsky.UnspeccedSearchActorsSkeleton_Output, error) {
+func (s *Server) SearchProfiles(ctx context.Context, params *ActorSearchParams) (*appbsky.UnspeccedSearchActorsSkeleton_Output, error) {
 	ctx, span := tracer.Start(ctx, "SearchProfiles")
 	defer span.End()
+	span.SetAttributes(
+		attribute.String("query", params.Query),
+		attribute.Bool("typeahead", params.Typeahead),
+		attribute.Int("offset", params.Offset),
+		attribute.Int("size", params.Size),
+	)
 
-	var resp *EsSearchResponse
-	var err error
-	if typeahead {
-		resp, err = DoSearchProfilesTypeahead(ctx, s.escli, s.profileIndex, q, size)
-	} else {
-		resp, err = DoSearchProfiles(ctx, s.dir, s.escli, s.profileIndex, q, offset, size)
+	var globalResp *EsSearchResponse
+	var personalizedResp *EsSearchResponse
+	var globalErr error
+	var personalizedErr error
+
+	wg := sync.WaitGroup{}
+
+	wg.Add(1)
+	// Conduct the global search
+	go func(myQ ActorSearchParams) {
+		defer wg.Done()
+		// Clear out the following list to conduct the global search
+		myQ.Follows = nil
+
+		if myQ.Typeahead {
+			globalResp, globalErr = DoSearchProfilesTypeahead(ctx, s.escli, s.profileIndex, &myQ)
+		} else {
+			globalResp, globalErr = DoSearchProfiles(ctx, s.dir, s.escli, s.profileIndex, &myQ)
+		}
+	}(*params)
+
+	// If we have a following list, conduct a second search to filter the results
+	if len(params.Follows) > 0 {
+		wg.Add(1)
+		go func(myQ ActorSearchParams) {
+			defer wg.Done()
+			if myQ.Typeahead {
+				personalizedResp, personalizedErr = DoSearchProfilesTypeahead(ctx, s.escli, s.profileIndex, &myQ)
+			} else {
+				personalizedResp, personalizedErr = DoSearchProfiles(ctx, s.dir, s.escli, s.profileIndex, &myQ)
+			}
+		}(*params)
 	}
-	if err != nil {
-		return nil, err
+
+	wg.Wait()
+
+	if globalErr != nil {
+		return nil, globalErr
+	}
+
+	if len(params.Follows) > 0 {
+		if personalizedErr != nil {
+			return nil, personalizedErr
+		}
+
+		followingBoost := 0.1
+
+		// Insert the personalized results into the global results, deduping as we go and maintaining score-order
+		followingSeen := map[string]struct{}{}
+		for _, r := range personalizedResp.Hits.Hits {
+			var doc ProfileDoc
+			if err := json.Unmarshal(r.Source, &doc); err != nil {
+				return nil, fmt.Errorf("decoding profile doc from search response: %w", err)
+			}
+
+			did, err := syntax.ParseDID(doc.DID)
+			if err != nil {
+				return nil, fmt.Errorf("invalid DID in indexed document: %w", err)
+			}
+
+			if _, ok := followingSeen[did.String()]; ok {
+				continue
+			}
+
+			followingSeen[did.String()] = struct{}{}
+
+			// Insert the profile into the global results
+			globalResp.Hits.Hits = append(globalResp.Hits.Hits, r)
+		}
+
+		// Walk the combined results and boost the scores of the personalized results and dedupe
+		seen := map[string]struct{}{}
+		deduped := []EsSearchHit{}
+		for _, r := range globalResp.Hits.Hits {
+			var doc ProfileDoc
+			if err := json.Unmarshal(r.Source, &doc); err != nil {
+				return nil, fmt.Errorf("decoding profile doc from search response: %w", err)
+			}
+
+			did, err := syntax.ParseDID(doc.DID)
+			if err != nil {
+				return nil, fmt.Errorf("invalid DID in indexed document: %w", err)
+			}
+
+			// Boost the score of the personalized results
+			if _, ok := followingSeen[did.String()]; ok {
+				r.Score += followingBoost
+			}
+
+			// Dedupe the results
+			if _, ok := seen[did.String()]; ok {
+				continue
+			}
+
+			seen[did.String()] = struct{}{}
+			deduped = append(deduped, r)
+		}
+
+		// Sort the results by score
+		slices.SortFunc(deduped, func(a, b EsSearchHit) int {
+			if a.Score < b.Score {
+				return 1
+			}
+			if a.Score > b.Score {
+				return -1
+			}
+			return 0
+		})
+
+		// Trim the results to the requested size
+		if len(deduped) > params.Size {
+			deduped = deduped[:params.Size]
+		}
+
+		globalResp.Hits.Hits = deduped
 	}
 
 	actors := []*appbsky.UnspeccedDefs_SkeletonSearchActor{}
-	for _, r := range resp.Hits.Hits {
+	for _, r := range globalResp.Hits.Hits {
 		var doc ProfileDoc
 		if err := json.Unmarshal(r.Source, &doc); err != nil {
 			return nil, fmt.Errorf("decoding profile doc from search response: %w", err)
@@ -264,12 +461,12 @@ func (s *Server) SearchProfiles(ctx context.Context, q string, typeahead bool, o
 	}
 
 	out := appbsky.UnspeccedSearchActorsSkeleton_Output{Actors: actors}
-	if len(actors) == size && (offset+size) < 10000 {
-		s := fmt.Sprintf("%d", offset+size)
+	if len(actors) == params.Size && (params.Offset+params.Size) < 10000 {
+		s := fmt.Sprintf("%d", params.Offset+params.Size)
 		out.Cursor = &s
 	}
-	if resp.Hits.Total.Relation == "eq" {
-		i := int64(resp.Hits.Total.Value)
+	if globalResp.Hits.Total.Relation == "eq" {
+		i := int64(globalResp.Hits.Total.Value)
 		out.HitsTotal = &i
 	}
 	return &out, nil

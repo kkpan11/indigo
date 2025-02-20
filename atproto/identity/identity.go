@@ -1,75 +1,15 @@
 package identity
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/bluesky-social/indigo/atproto/crypto"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	"github.com/mr-tron/base58"
 )
-
-// API for doing account lookups by DID or handle, with bi-directional verification handled automatically. Almost all atproto services and clients should use an implementation of this interface instead of resolving handles or DIDs separately
-//
-// Handles which fail to resolve, or don't match DID alsoKnownAs, are an error. DIDs which resolve but the handle does not resolve back to the DID return an Identity where the Handle is the special `handle.invalid` value.
-//
-// Some example implementations of this interface could be:
-//   - basic direct resolution on every call
-//   - local in-memory caching layer to reduce network hits
-//   - API client, which just makes requests to PDS (or other remote service)
-//   - client for shared network cache (eg, Redis)
-type Directory interface {
-	LookupHandle(ctx context.Context, h syntax.Handle) (*Identity, error)
-	LookupDID(ctx context.Context, d syntax.DID) (*Identity, error)
-	Lookup(ctx context.Context, i syntax.AtIdentifier) (*Identity, error)
-
-	// Flushes any cache of the indicated identifier. If directory is not using caching, can ignore this.
-	Purge(ctx context.Context, i syntax.AtIdentifier) error
-}
-
-// Indicates that resolution process completed successfully, but handle does not exist.
-var ErrHandleNotFound = errors.New("handle not found")
-
-// Indicates that handle and DID resolved, but handle points to a DID with a different handle. This is only returned when looking up a handle, not when looking up a DID.
-var ErrHandleNotValid = errors.New("handle resolves to DID with different handle")
-
-// Handle top-level domain (TLD) is one of the special "Reserved" suffixes, and not allowed for atproto use
-var ErrHandleReservedTLD = errors.New("handle top-level domain is disallowed")
-
-// Indicates that resolution process completed successfully, but the DID does not exist.
-var ErrDIDNotFound = errors.New("DID not found")
-
-var ErrKeyNotFound = errors.New("identity has no public repo signing key")
-
-var DefaultPLCURL = "https://plc.directory"
-
-// Returns a reasonable Directory implementation for applications
-func DefaultDirectory() Directory {
-	base := BaseDirectory{
-		PLCURL: DefaultPLCURL,
-		HTTPClient: http.Client{
-			Timeout: time.Second * 15,
-		},
-		Resolver: net.Resolver{
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{Timeout: time.Second * 5}
-				return d.DialContext(ctx, network, address)
-			},
-		},
-		TryAuthoritativeDNS: true,
-		// primary Bluesky PDS instance only supports HTTP resolution method
-		SkipDNSDomainSuffixes: []string{".bsky.social"},
-	}
-	cached := NewCacheDirectory(&base, 10000, time.Hour*24, time.Minute*2)
-	return &cached
-}
 
 // Represents an atproto identity. Could be a regular user account, or a service account (eg, feed generator)
 type Identity struct {
@@ -82,9 +22,6 @@ type Identity struct {
 	AlsoKnownAs []string
 	Services    map[string]Service
 	Keys        map[string]Key
-
-	// If a valid atproto repo signing public key was parsed, it can be cached here. This is a nullable/optional field (crypto.PublicKey is an interface). Calling code should use [Identity.PublicKey] instead of accessing this member.
-	ParsedPublicKey crypto.PublicKey
 }
 
 type Key struct {
@@ -146,21 +83,57 @@ func ParseIdentity(doc *DIDDocument) Identity {
 	}
 }
 
-// Identifies and parses the atproto repo signing public key, specifically, out of any keys associated with this identity.
+// Helper to generate a DID document based on an identity. Note that there is flexibility around parsing, and this won't necessarily "round-trip" for every valid DID document.
+func (ident *Identity) DIDDocument() DIDDocument {
+	doc := DIDDocument{
+		DID:                ident.DID,
+		AlsoKnownAs:        ident.AlsoKnownAs,
+		VerificationMethod: make([]DocVerificationMethod, len(ident.Keys)),
+		Service:            make([]DocService, len(ident.Services)),
+	}
+	i := 0
+	for k, key := range ident.Keys {
+		doc.VerificationMethod[i] = DocVerificationMethod{
+			ID:                 fmt.Sprintf("%s#%s", ident.DID, k),
+			Type:               key.Type,
+			Controller:         ident.DID.String(),
+			PublicKeyMultibase: key.PublicKeyMultibase,
+		}
+		i += 1
+	}
+	i = 0
+	for k, svc := range ident.Services {
+		doc.Service[i] = DocService{
+			ID:              fmt.Sprintf("#%s", k),
+			Type:            svc.Type,
+			ServiceEndpoint: svc.URL,
+		}
+		i += 1
+	}
+	return doc
+}
+
+// Identifies and parses the atproto repo signing public key, specifically, out of any keys in this identity's DID document.
 //
 // Returns [ErrKeyNotFound] if there is no such key.
 //
 // Note that [crypto.PublicKey] is an interface, not a concrete type.
 func (i *Identity) PublicKey() (crypto.PublicKey, error) {
-	if i.ParsedPublicKey != nil {
-		return i.ParsedPublicKey, nil
-	}
+	return i.GetPublicKey("atproto")
+}
+
+// Identifies and parses a specified service signing public key out of any keys in this identity's DID document.
+//
+// Returns [ErrKeyNotFound] if there is no such key.
+//
+// Note that [crypto.PublicKey] is an interface, not a concrete type.
+func (i *Identity) GetPublicKey(id string) (crypto.PublicKey, error) {
 	if i.Keys == nil {
-		return nil, fmt.Errorf("identity has no atproto public key attached")
+		return nil, ErrKeyNotDeclared
 	}
-	k, ok := i.Keys["atproto"]
+	k, ok := i.Keys[id]
 	if !ok {
-		return nil, ErrKeyNotFound
+		return nil, ErrKeyNotDeclared
 	}
 	switch k.Type {
 	case "Multikey":
@@ -188,14 +161,25 @@ func (i *Identity) PublicKey() (crypto.PublicKey, error) {
 	}
 }
 
-// The home PDS endpoint for this account, if one is included in identity metadata (returns empty string if not found).
+// The home PDS endpoint for this identity, if one is included in the DID document.
 //
-// The endpoint should be an HTTP URL with method, hostname, and optional port, and (usually) no path segments.
+// The endpoint should be an HTTP URL with method, hostname, and optional port. It may or may not include path segments.
+//
+// Returns an empty string if the service isn't found, or if the URL fails to parse.
 func (i *Identity) PDSEndpoint() string {
+	return i.GetServiceEndpoint("atproto_pds")
+}
+
+// Returns the service endpoint URL for specified service ID (the fragment part of identifier, not including the hash symbol).
+//
+// The endpoint should be an HTTP URL with method, hostname, and optional port. It may or may not include path segments.
+//
+// Returns an empty string if the service isn't found, or if the URL fails to parse.
+func (i *Identity) GetServiceEndpoint(id string) string {
 	if i.Services == nil {
 		return ""
 	}
-	endpoint, ok := i.Services["atproto_pds"]
+	endpoint, ok := i.Services[id]
 	if !ok {
 		return ""
 	}
@@ -206,7 +190,7 @@ func (i *Identity) PDSEndpoint() string {
 	return endpoint.URL
 }
 
-// Returns an atproto handle from the alsoKnownAs URI list for this identifier. Returns an error if there is no handle, or if an at:// URI failes to parse as a handle.
+// Returns an atproto handle from the alsoKnownAs URI list for this identifier. Returns an error if there is no handle, or if an at:// URI fails to parse as a handle.
 //
 // Note that this handle is *not* necessarily to be trusted, as it may not have been bi-directionally verified. The 'Handle' field on the 'Identity' should contain either a verified handle, or the special 'handle.invalid' indicator value.
 func (i *Identity) DeclaredHandle() (syntax.Handle, error) {
@@ -215,5 +199,5 @@ func (i *Identity) DeclaredHandle() (syntax.Handle, error) {
 			return syntax.ParseHandle(u[5:])
 		}
 	}
-	return "", fmt.Errorf("DID document contains no atproto handle")
+	return "", ErrHandleNotDeclared
 }

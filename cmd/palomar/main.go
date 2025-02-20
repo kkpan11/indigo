@@ -65,7 +65,7 @@ func run(args []string) error {
 		&cli.StringFlag{
 			Name:    "elastic-password",
 			Usage:   "elasticsearch password",
-			Value:   "admin",
+			Value:   "0penSearch-Pal0mar",
 			EnvVars: []string{"ES_PASSWORD", "ELASTIC_PASSWORD"},
 		},
 		&cli.StringFlag{
@@ -87,10 +87,10 @@ func run(args []string) error {
 			EnvVars: []string{"ES_PROFILE_INDEX"},
 		},
 		&cli.StringFlag{
-			Name:    "atp-bgs-host",
-			Usage:   "hostname and port of BGS to subscribe to",
-			Value:   "wss://bsky.social",
-			EnvVars: []string{"ATP_BGS_HOST"},
+			Name:    "atp-relay-host",
+			Usage:   "hostname and port of Relay to subscribe to",
+			Value:   "wss://bsky.network",
+			EnvVars: []string{"ATP_RELAY_HOST", "ATP_BGS_HOST"},
 		},
 		&cli.StringFlag{
 			Name:    "atp-plc-host",
@@ -102,6 +102,12 @@ func run(args []string) error {
 			Name:    "max-metadb-connections",
 			EnvVars: []string{"MAX_METADB_CONNECTIONS"},
 			Value:   40,
+		},
+		&cli.StringFlag{
+			Name:    "log-level",
+			Usage:   "log level (debug, info, warn, error)",
+			Value:   "info",
+			EnvVars: []string{"GOLOG_LOG_LEVEL", "LOG_LEVEL"},
 		},
 	}
 
@@ -141,10 +147,10 @@ var runCmd = &cli.Command{
 			EnvVars: []string{"PALOMAR_METRICS_LISTEN"},
 		},
 		&cli.IntFlag{
-			Name:    "bgs-sync-rate-limit",
-			Usage:   "max repo sync (checkout) requests per second to upstream (BGS)",
+			Name:    "relay-sync-rate-limit",
+			Usage:   "max repo sync (checkout) requests per second to upstream (Relay)",
 			Value:   8,
-			EnvVars: []string{"PALOMAR_BGS_SYNC_RATE_LIMIT"},
+			EnvVars: []string{"PALOMAR_RELAY_SYNC_RATE_LIMIT", "PALOMAR_BGS_SYNC_RATE_LIMIT"},
 		},
 		&cli.IntFlag{
 			Name:    "index-max-concurrency",
@@ -153,17 +159,56 @@ var runCmd = &cli.Command{
 			EnvVars: []string{"PALOMAR_INDEX_MAX_CONCURRENCY"},
 		},
 		&cli.IntFlag{
+			Name:    "indexing-rate-limit",
+			Usage:   "max number of documents per second to index",
+			Value:   50_000,
+			EnvVars: []string{"PALOMAR_INDEXING_RATE_LIMIT"},
+		},
+		&cli.IntFlag{
 			Name:    "plc-rate-limit",
 			Usage:   "max number of requests per second to PLC registry",
 			Value:   100,
 			EnvVars: []string{"PALOMAR_PLC_RATE_LIMIT"},
 		},
+		&cli.BoolFlag{
+			Name:    "discover-repos",
+			Usage:   "if true, discover repositories from the Relay",
+			EnvVars: []string{"PALOMAR_DISCOVER_REPOS"},
+			Value:   false,
+		},
+		&cli.StringFlag{
+			Name:    "pagerank-file",
+			EnvVars: []string{"PAGERANK_FILE"},
+		},
+		&cli.StringFlag{
+			Name:    "bulk-posts-file",
+			EnvVars: []string{"BULK_POSTS_FILE"},
+		},
+		&cli.StringFlag{
+			Name:    "bulk-profiles-file",
+			EnvVars: []string{"BULK_PROFILES_FILE"},
+		},
 	},
 	Action: func(cctx *cli.Context) error {
+		logLevel := slog.LevelInfo
+		switch cctx.String("log-level") {
+		case "debug":
+			logLevel = slog.LevelDebug
+		case "info":
+			logLevel = slog.LevelInfo
+		case "warn":
+			logLevel = slog.LevelWarn
+		case "error":
+			logLevel = slog.LevelError
+		}
+
 		logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
+			Level:     logLevel,
+			AddSource: true,
 		}))
 		slog.SetDefault(logger)
+
+		readonly := cctx.Bool("readonly")
 
 		// Enable OTLP HTTP exporter
 		// For relevant environment variables:
@@ -200,17 +245,11 @@ var runCmd = &cli.Command{
 			otel.SetTracerProvider(tp)
 		}
 
-		db, err := cliutil.SetupDatabase(cctx.String("database-url"), cctx.Int("max-metadb-connections"))
-		if err != nil {
-			return err
-		}
-
 		escli, err := createEsClient(cctx)
 		if err != nil {
 			return fmt.Errorf("failed to get elasticsearch: %w", err)
 		}
 
-		// TODO: replace this with "bingo" resolver
 		base := identity.BaseDirectory{
 			PLCURL: cctx.String("atp-plc-host"),
 			HTTPClient: http.Client{
@@ -220,23 +259,43 @@ var runCmd = &cli.Command{
 			TryAuthoritativeDNS:   true,
 			SkipDNSDomainSuffixes: []string{".bsky.social"},
 		}
-		dir := identity.NewCacheDirectory(&base, 1_500_000, time.Hour*24, time.Minute*2)
+		dir := identity.NewCacheDirectory(&base, 1_500_000, time.Hour*24, time.Minute*2, time.Minute*5)
 
-		srv, err := search.NewServer(
-			db,
-			escli,
-			&dir,
-			search.Config{
-				BGSHost:             cctx.String("atp-bgs-host"),
+		apiConfig := search.ServerConfig{
+			Logger:       logger,
+			ProfileIndex: cctx.String("es-profile-index"),
+			PostIndex:    cctx.String("es-post-index"),
+		}
+
+		srv, err := search.NewServer(escli, &dir, apiConfig)
+		if err != nil {
+			return err
+		}
+
+		// Configure the indexer if we're not in readonly mode
+		if !readonly {
+			db, err := cliutil.SetupDatabase(cctx.String("database-url"), cctx.Int("max-metadb-connections"))
+			if err != nil {
+				return fmt.Errorf("failed to set up database: %w", err)
+			}
+
+			indexerConfig := search.IndexerConfig{
+				RelayHost:           cctx.String("atp-relay-host"),
 				ProfileIndex:        cctx.String("es-profile-index"),
 				PostIndex:           cctx.String("es-post-index"),
 				Logger:              logger,
-				BGSSyncRateLimit:    cctx.Int("bgs-sync-rate-limit"),
+				RelaySyncRateLimit:  cctx.Int("relay-sync-rate-limit"),
 				IndexMaxConcurrency: cctx.Int("index-max-concurrency"),
-			},
-		)
-		if err != nil {
-			return err
+				DiscoverRepos:       cctx.Bool("discover-repos"),
+				IndexingRateLimit:   cctx.Int("indexing-rate-limit"),
+			}
+
+			idx, err := search.NewIndexer(db, escli, &dir, indexerConfig)
+			if err != nil {
+				return fmt.Errorf("failed to set up indexer: %w", err)
+			}
+
+			srv.Indexer = idx
 		}
 
 		go func() {
@@ -250,14 +309,34 @@ var runCmd = &cli.Command{
 			srv.RunAPI(cctx.String("bind"))
 		}()
 
-		if cctx.Bool("readonly") {
+		// If we're in readonly mode, just block forever
+		if readonly {
 			select {}
-		} else {
+		} else if cctx.String("pagerank-file") != "" && srv.Indexer != nil {
+			// If we're not in readonly mode, and we have a pagerank file, update pageranks
 			ctx := context.Background()
-			if err := srv.EnsureIndices(ctx); err != nil {
+			if err := srv.Indexer.BulkIndexPageranks(ctx, cctx.String("pagerank-file")); err != nil {
+				return fmt.Errorf("failed to update pageranks: %w", err)
+			}
+		} else if cctx.String("bulk-posts-file") != "" && srv.Indexer != nil {
+			// If we're not in readonly mode, and we have a bulk posts file, index posts
+			ctx := context.Background()
+			if err := srv.Indexer.BulkIndexPosts(ctx, cctx.String("bulk-posts-file")); err != nil {
+				return fmt.Errorf("failed to bulk index posts: %w", err)
+			}
+		} else if cctx.String("bulk-profiles-file") != "" && srv.Indexer != nil {
+			// If we're not in readonly mode, and we have a bulk profiles file, index profiles
+			ctx := context.Background()
+			if err := srv.Indexer.BulkIndexProfiles(ctx, cctx.String("bulk-profiles-file")); err != nil {
+				return fmt.Errorf("failed to bulk index profiles: %w", err)
+			}
+		} else if srv.Indexer != nil {
+			// Otherwise, just run the indexer
+			ctx := context.Background()
+			if err := srv.Indexer.EnsureIndices(ctx); err != nil {
 				return fmt.Errorf("failed to create opensearch indices: %w", err)
 			}
-			if err := srv.RunIndexer(ctx); err != nil {
+			if err := srv.Indexer.RunIndexer(ctx); err != nil {
 				return fmt.Errorf("failed to run indexer: %w", err)
 			}
 		}
@@ -323,9 +402,11 @@ var searchPostCmd = &cli.Command{
 			identity.DefaultDirectory(), // TODO: parse PLC arg
 			escli,
 			cctx.String("es-post-index"),
-			strings.Join(cctx.Args().Slice(), " "),
-			0,
-			20,
+			&search.PostSearchParams{
+				Query:  strings.Join(cctx.Args().Slice(), " "),
+				Offset: 0,
+				Size:   20,
+			},
 		)
 		if err != nil {
 			return err
@@ -353,8 +434,10 @@ var searchProfileCmd = &cli.Command{
 				context.Background(),
 				escli,
 				cctx.String("es-profile-index"),
-				strings.Join(cctx.Args().Slice(), " "),
-				10,
+				&search.ActorSearchParams{
+					Query: strings.Join(cctx.Args().Slice(), " "),
+					Size:  10,
+				},
 			)
 			if err != nil {
 				return err
@@ -366,9 +449,11 @@ var searchProfileCmd = &cli.Command{
 				identity.DefaultDirectory(), // TODO: parse PLC arg
 				escli,
 				cctx.String("es-profile-index"),
-				strings.Join(cctx.Args().Slice(), " "),
-				0,
-				20,
+				&search.ActorSearchParams{
+					Query:  strings.Join(cctx.Args().Slice(), " "),
+					Offset: 0,
+					Size:   20,
+				},
 			)
 			if err != nil {
 				return err

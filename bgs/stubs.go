@@ -22,42 +22,14 @@ func (s *BGS) RegisterHandlersAppBsky(e *echo.Echo) error {
 }
 
 func (s *BGS) RegisterHandlersComAtproto(e *echo.Echo) error {
-	e.GET("/xrpc/com.atproto.sync.getBlob", s.HandleComAtprotoSyncGetBlob)
 	e.GET("/xrpc/com.atproto.sync.getBlocks", s.HandleComAtprotoSyncGetBlocks)
 	e.GET("/xrpc/com.atproto.sync.getLatestCommit", s.HandleComAtprotoSyncGetLatestCommit)
 	e.GET("/xrpc/com.atproto.sync.getRecord", s.HandleComAtprotoSyncGetRecord)
 	e.GET("/xrpc/com.atproto.sync.getRepo", s.HandleComAtprotoSyncGetRepo)
-	e.GET("/xrpc/com.atproto.sync.listBlobs", s.HandleComAtprotoSyncListBlobs)
 	e.GET("/xrpc/com.atproto.sync.listRepos", s.HandleComAtprotoSyncListRepos)
 	e.POST("/xrpc/com.atproto.sync.notifyOfUpdate", s.HandleComAtprotoSyncNotifyOfUpdate)
 	e.POST("/xrpc/com.atproto.sync.requestCrawl", s.HandleComAtprotoSyncRequestCrawl)
 	return nil
-}
-
-func (s *BGS) HandleComAtprotoSyncGetBlob(c echo.Context) error {
-	ctx, span := otel.Tracer("server").Start(c.Request().Context(), "HandleComAtprotoSyncGetBlob")
-	defer span.End()
-	bCid := c.QueryParam("cid")
-	did := c.QueryParam("did")
-
-	_, err := cid.Parse(bCid)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid cid: %s", bCid)})
-	}
-
-	_, err = syntax.ParseDID(did)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid did: %s", did)})
-	}
-
-	var out io.Reader
-	var handleErr error
-	// func (s *BGS) handleComAtprotoSyncGetBlob(ctx context.Context,cid string,did string) (io.Reader, error)
-	out, handleErr = s.handleComAtprotoSyncGetBlob(ctx, bCid, did)
-	if handleErr != nil {
-		return handleErr
-	}
-	return c.Stream(200, "application/octet-stream", out)
 }
 
 func (s *BGS) HandleComAtprotoSyncGetBlocks(c echo.Context) error {
@@ -161,58 +133,32 @@ func (s *BGS) HandleComAtprotoSyncGetRepo(c echo.Context) error {
 	return c.Stream(200, "application/vnd.ipld.car", out)
 }
 
-func (s *BGS) HandleComAtprotoSyncListBlobs(c echo.Context) error {
-	ctx, span := otel.Tracer("server").Start(c.Request().Context(), "HandleComAtprotoSyncListBlobs")
-	defer span.End()
-	cursor := c.QueryParam("cursor")
-	did := c.QueryParam("did")
-
-	var limit int
-	if p := c.QueryParam("limit"); p != "" {
-		var err error
-		limit, err = strconv.Atoi(p)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid limit: %s", p)})
-		}
-	} else {
-		limit = 500
-	}
-
-	_, err := syntax.ParseDID(did)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid did: %s", did)})
-	}
-
-	since := c.QueryParam("since")
-	var out *comatprototypes.SyncListBlobs_Output
-	var handleErr error
-	// func (s *BGS) handleComAtprotoSyncListBlobs(ctx context.Context,cursor string,did string,limit int,since string) (*comatprototypes.SyncListBlobs_Output, error)
-	out, handleErr = s.handleComAtprotoSyncListBlobs(ctx, cursor, did, limit, since)
-	if handleErr != nil {
-		return handleErr
-	}
-	return c.JSON(200, out)
-}
-
 func (s *BGS) HandleComAtprotoSyncListRepos(c echo.Context) error {
 	ctx, span := otel.Tracer("server").Start(c.Request().Context(), "HandleComAtprotoSyncListRepos")
 	defer span.End()
-	cursor := c.QueryParam("cursor")
 
-	var limit int
-	if p := c.QueryParam("limit"); p != "" {
-		var err error
-		limit, err = strconv.Atoi(p)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid limit: %s", p)})
+	cursorQuery := c.QueryParam("cursor")
+	limitQuery := c.QueryParam("limit")
+
+	var err error
+
+	limit := 500
+	if limitQuery != "" {
+		limit, err = strconv.Atoi(limitQuery)
+		if err != nil || limit < 1 || limit > 1000 {
+			return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid limit: %s", limitQuery)})
 		}
-	} else {
-		limit = 500
 	}
-	var out *comatprototypes.SyncListRepos_Output
-	var handleErr error
-	// func (s *BGS) handleComAtprotoSyncListRepos(ctx context.Context,cursor string,limit int) (*comatprototypes.SyncListRepos_Output, error)
-	out, handleErr = s.handleComAtprotoSyncListRepos(ctx, cursor, limit)
+
+	cursor := int64(0)
+	if cursorQuery != "" {
+		cursor, err = strconv.ParseInt(cursorQuery, 10, 64)
+		if err != nil || cursor < 0 {
+			return c.JSON(http.StatusBadRequest, XRPCError{Message: fmt.Sprintf("invalid cursor: %s", cursorQuery)})
+		}
+	}
+
+	out, handleErr := s.handleComAtprotoSyncListRepos(ctx, cursor, limit)
 	if handleErr != nil {
 		return handleErr
 	}

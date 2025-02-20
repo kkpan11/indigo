@@ -122,7 +122,9 @@ func makeParams(p map[string]any) string {
 	params := url.Values{}
 	for k, v := range p {
 		if s, ok := v.([]string); ok {
-			params.Add(k, strings.Join(s, ","))
+			for _, v := range s {
+				params.Add(k, v)
+			}
 		} else {
 			params.Add(k, fmt.Sprint(v))
 		}
@@ -182,7 +184,7 @@ func (c *Client) Do(ctx context.Context, kind XRPCRequestType, inpenc string, me
 	}
 
 	// use admin auth if we have it configured and are doing a request that requires it
-	if c.AdminToken != nil && (strings.HasPrefix(method, "com.atproto.admin.") || method == "com.atproto.account.createInviteCode" || method == "com.atproto.server.createInviteCodes") {
+	if c.AdminToken != nil && (strings.HasPrefix(method, "com.atproto.admin.") || strings.HasPrefix(method, "tools.ozone.") || method == "com.atproto.server.createInviteCode" || method == "com.atproto.server.createInviteCodes") {
 		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("admin:"+*c.AdminToken)))
 	} else if c.Auth != nil {
 		req.Header.Set("Authorization", "Bearer "+c.Auth.AccessJwt)

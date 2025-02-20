@@ -20,16 +20,21 @@ func init() {
 } //
 // RECORDTYPE: FeedGenerator
 type FeedGenerator struct {
-	LexiconTypeID     string                `json:"$type,const=app.bsky.feed.generator" cborgen:"$type,const=app.bsky.feed.generator"`
-	Avatar            *util.LexBlob         `json:"avatar,omitempty" cborgen:"avatar,omitempty"`
-	CreatedAt         string                `json:"createdAt" cborgen:"createdAt"`
-	Description       *string               `json:"description,omitempty" cborgen:"description,omitempty"`
-	DescriptionFacets []*RichtextFacet      `json:"descriptionFacets,omitempty" cborgen:"descriptionFacets,omitempty"`
-	Did               string                `json:"did" cborgen:"did"`
-	DisplayName       string                `json:"displayName" cborgen:"displayName"`
-	Labels            *FeedGenerator_Labels `json:"labels,omitempty" cborgen:"labels,omitempty"`
+	LexiconTypeID string `json:"$type,const=app.bsky.feed.generator" cborgen:"$type,const=app.bsky.feed.generator"`
+	// acceptsInteractions: Declaration that a feed accepts feedback interactions from a client through app.bsky.feed.sendInteractions
+	AcceptsInteractions *bool            `json:"acceptsInteractions,omitempty" cborgen:"acceptsInteractions,omitempty"`
+	Avatar              *util.LexBlob    `json:"avatar,omitempty" cborgen:"avatar,omitempty"`
+	ContentMode         *string          `json:"contentMode,omitempty" cborgen:"contentMode,omitempty"`
+	CreatedAt           string           `json:"createdAt" cborgen:"createdAt"`
+	Description         *string          `json:"description,omitempty" cborgen:"description,omitempty"`
+	DescriptionFacets   []*RichtextFacet `json:"descriptionFacets,omitempty" cborgen:"descriptionFacets,omitempty"`
+	Did                 string           `json:"did" cborgen:"did"`
+	DisplayName         string           `json:"displayName" cborgen:"displayName"`
+	// labels: Self-label values
+	Labels *FeedGenerator_Labels `json:"labels,omitempty" cborgen:"labels,omitempty"`
 }
 
+// Self-label values
 type FeedGenerator_Labels struct {
 	LabelDefs_SelfLabels *comatprototypes.LabelDefs_SelfLabels
 }

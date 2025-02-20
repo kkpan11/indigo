@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"time"
 
@@ -16,10 +17,13 @@ import (
 	"github.com/bluesky-social/indigo/xrpc"
 
 	"github.com/brianvoe/gofakeit/v6"
-	logging "github.com/ipfs/go-log"
 )
 
-var log = logging.Logger("fakedata")
+var log = slog.Default().With("system", "fakedata")
+
+func SetLogger(logger *slog.Logger) {
+	log = logger
+}
 
 func MeasureIterations(name string) func(int) {
 	start := time.Now()
@@ -28,7 +32,7 @@ func MeasureIterations(name string) func(int) {
 			return
 		}
 		total := time.Since(start)
-		log.Infof("%s wall runtime: count=%d total=%s mean=%s", name, count, total, total/time.Duration(count))
+		log.Info("wall runtime", "name", name, "count", count, "total", total, "rate", total/time.Duration(count))
 	}
 }
 
@@ -115,7 +119,7 @@ func GenProfile(xrpcc *xrpc.Client, acc *AccountContext, genAvatar, genBanner bo
 		Repo:       acc.Auth.Did,
 		Collection: "app.bsky.actor.profile",
 		Rkey:       "self",
-		Record: &lexutil.LexiconTypeDecoder{&appbsky.ActorProfile{
+		Record: &lexutil.LexiconTypeDecoder{Val: &appbsky.ActorProfile{
 			Description: &desc,
 			DisplayName: &name,
 			Avatar:      avatar,
@@ -201,7 +205,7 @@ func GenPosts(xrpcc *xrpc.Client, catalog *AccountCatalog, acc *AccountContext, 
 		if _, err := comatproto.RepoCreateRecord(ctx, xrpcc, &comatproto.RepoCreateRecord_Input{
 			Collection: "app.bsky.feed.post",
 			Repo:       acc.Auth.Did,
-			Record:     &lexutil.LexiconTypeDecoder{&post},
+			Record:     &lexutil.LexiconTypeDecoder{Val: &post},
 		}); err != nil {
 			return err
 		}
@@ -218,7 +222,7 @@ func CreateFollow(xrpcc *xrpc.Client, tgt *AccountContext) error {
 	_, err := comatproto.RepoCreateRecord(context.TODO(), xrpcc, &comatproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.graph.follow",
 		Repo:       xrpcc.Auth.Did,
-		Record:     &lexutil.LexiconTypeDecoder{follow},
+		Record:     &lexutil.LexiconTypeDecoder{Val: follow},
 	})
 	return err
 }
@@ -236,7 +240,7 @@ func CreateLike(xrpcc *xrpc.Client, viewPost *appbsky.FeedDefs_FeedViewPost) err
 	_, err := comatproto.RepoCreateRecord(ctx, xrpcc, &comatproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.feed.like",
 		Repo:       xrpcc.Auth.Did,
-		Record:     &lexutil.LexiconTypeDecoder{&like},
+		Record:     &lexutil.LexiconTypeDecoder{Val: &like},
 	})
 	return err
 }
@@ -252,7 +256,7 @@ func CreateRepost(xrpcc *xrpc.Client, viewPost *appbsky.FeedDefs_FeedViewPost) e
 	_, err := comatproto.RepoCreateRecord(context.TODO(), xrpcc, &comatproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.feed.repost",
 		Repo:       xrpcc.Auth.Did,
-		Record:     &lexutil.LexiconTypeDecoder{repost},
+		Record:     &lexutil.LexiconTypeDecoder{Val: repost},
 	})
 	return err
 }
@@ -284,7 +288,7 @@ func CreateReply(xrpcc *xrpc.Client, viewPost *appbsky.FeedDefs_FeedViewPost) er
 	_, err := comatproto.RepoCreateRecord(context.TODO(), xrpcc, &comatproto.RepoCreateRecord_Input{
 		Collection: "app.bsky.feed.post",
 		Repo:       xrpcc.Auth.Did,
-		Record:     &lexutil.LexiconTypeDecoder{replyPost},
+		Record:     &lexutil.LexiconTypeDecoder{Val: replyPost},
 	})
 	return err
 }
@@ -295,10 +299,10 @@ func GenFollowsAndMutes(xrpcc *xrpc.Client, catalog *AccountCatalog, acc *Accoun
 	var tgt *AccountContext
 
 	if maxFollows > len(catalog.Regulars) {
-		return fmt.Errorf("not enought regulars to pick maxFollowers from")
+		return fmt.Errorf("not enough regulars to pick maxFollowers from")
 	}
 	if maxMutes > len(catalog.Regulars) {
-		return fmt.Errorf("not enought regulars to pick maxMutes from")
+		return fmt.Errorf("not enough regulars to pick maxMutes from")
 	}
 
 	regCount := 0
@@ -386,7 +390,7 @@ func GenLikesRepostsReplies(xrpcc *xrpc.Client, acc *AccountContext, fracLike, f
 func BrowseAccount(xrpcc *xrpc.Client, acc *AccountContext) error {
 	// fetch notifications
 	maxNotif := 50
-	resp, err := appbsky.NotificationListNotifications(context.TODO(), xrpcc, "", int64(maxNotif), "")
+	resp, err := appbsky.NotificationListNotifications(context.TODO(), xrpcc, "", int64(maxNotif), false, nil, "")
 	if err != nil {
 		return err
 	}
@@ -405,7 +409,7 @@ func BrowseAccount(xrpcc *xrpc.Client, acc *AccountContext) error {
 			if err != nil {
 				return err
 			}
-			_, err = appbsky.FeedGetAuthorFeed(context.TODO(), xrpcc, notif.Author.Did, "", "", 50)
+			_, err = appbsky.FeedGetAuthorFeed(context.TODO(), xrpcc, notif.Author.Did, "", "", false, 50)
 			if err != nil {
 				return err
 			}
@@ -447,7 +451,7 @@ func BrowseAccount(xrpcc *xrpc.Client, acc *AccountContext) error {
 			if err != nil {
 				return err
 			}
-			_, err = appbsky.FeedGetAuthorFeed(context.TODO(), xrpcc, post.Post.Author.Did, "", "", 50)
+			_, err = appbsky.FeedGetAuthorFeed(context.TODO(), xrpcc, post.Post.Author.Did, "", "", false, 50)
 			if err != nil {
 				return err
 			}
@@ -456,6 +460,6 @@ func BrowseAccount(xrpcc *xrpc.Client, acc *AccountContext) error {
 	t2(len(timelineResp.Feed))
 
 	// notification count for good measure
-	_, err = appbsky.NotificationGetUnreadCount(context.TODO(), xrpcc, "")
+	_, err = appbsky.NotificationGetUnreadCount(context.TODO(), xrpcc, false, "")
 	return err
 }
